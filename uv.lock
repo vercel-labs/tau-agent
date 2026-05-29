@@ -8,7 +8,8 @@ resolution-markers = [
 
 [[package]]
 name = "ai"
-source = { editable = "../../" }
+version = "0.2.1.dev21+3dc99b6"
+source = { git = "https://github.com/vercel-labs/ai-python.git?rev=3dc99b6c9d3d210406ac801878847d92cd8527e2#3dc99b6c9d3d210406ac801878847d92cd8527e2" }
 dependencies = [
     { name = "httpx" },
     { name = "modelsdotdev" },
@@ -22,39 +23,6 @@ anthropic = [
 ]
 openai = [
     { name = "openai" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.83.0" },
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.18.0" },
-    { name = "modelsdotdev", specifier = "==0.*" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=2.14.0" },
-    { name = "pydantic", specifier = ">=2.12.5" },
-    { name = "typing-extensions", specifier = ">=4.15.0" },
-]
-provides-extras = ["anthropic", "mcp", "openai"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "anthropic", specifier = ">=0.83.0" },
-    { name = "async-solipsism", specifier = ">=0.9" },
-    { name = "mcp", specifier = ">=1.18.0" },
-    { name = "mypy", specifier = "~=2.1.0" },
-    { name = "openai", specifier = ">=2.14.0" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.24" },
-    { name = "python-dotenv", specifier = ">=1.2.1" },
-    { name = "rich", specifier = ">=14.2.0" },
-    { name = "ruff", specifier = "~=0.8.0" },
-    { name = "ty", specifier = "~=0.0.37" },
-]
-examples = [
-    { name = "fastapi", specifier = ">=0.136.1" },
-    { name = "temporalio", specifier = ">=1.27.2" },
-    { name = "textual", specifier = ">=8.2.6" },
-    { name = "websockets", specifier = ">=16.0" },
 ]
 
 [[package]]
@@ -664,7 +632,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ai", extras = ["anthropic", "openai"], editable = "../../" },
+    { name = "ai", extras = ["anthropic", "openai"], git = "https://github.com/vercel-labs/ai-python.git?rev=3dc99b6c9d3d210406ac801878847d92cd8527e2" },
     { name = "textual", specifier = ">=3.0" },
 ]
 

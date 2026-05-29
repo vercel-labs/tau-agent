@@ -19,7 +19,7 @@ build-backend = "hatchling.build"
 packages = ["tau"]
 
 [tool.uv.sources]
-ai = { path = "../..", editable = true }
+ai = { git = "https://github.com/vercel-labs/ai-python.git", rev = "3dc99b6c9d3d210406ac801878847d92cd8527e2" }
 
 [tool.ruff]
 line-length = 80
