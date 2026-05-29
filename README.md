@@ -1,6 +1,10 @@
 # tau-agent
 
-`tau` is a coding-agent demo built on the `ai` library.  Single
+`tau` is a coding-agent demo built on the
+[`ai`](https://github.com/vercel-labs/ai-python) library.
+The name is a loving homage to [pi](https://github.com/earendil-works/pi).
+
+Single
 process, Textual TUI, streaming replies, pi-style tool surface:
 
 - **`read`** — read files; offset/limit pagination with continuation hints
@@ -11,13 +15,13 @@ process, Textual TUI, streaming replies, pi-style tool surface:
 - **`find`** — glob match
 - **`ls`** — directory listing
 
+Anthropic and OpenAI's built in web search and web fetch tools are
+also available when appropriate.
+
 Approval-gated tools fire a `ToolApproval` hook; the composer turns
 into a `[y/n]` prompt mid-turn.  Unrelated text typed during a
 pending approval falls through to the message queue — the hook stays
 pending until you give it a y or n.
-
-No workspace jail.  The approval gate is the safety mechanism;
-everything else relies on you watching the prompts.
 
 ## Setup
 
@@ -31,11 +35,12 @@ uv sync
 uv run tau
 ```
 
-Type a message, hit enter.  `ctrl+c` to quit.
+Type a message, hit enter.  `ctrl+c` to quit. `ctrl+j` for newlines inside a message.
+Escape interrupts current task.
 
 ## Environment
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `AI_GATEWAY_API_KEY` | Vercel AI Gateway API key | — |
-| `TAU_MODEL` | Model id passed to `ai.ai_gateway(...)` | `anthropic/claude-sonnet-4.5` |
+| `TAU_MODEL` | Model id passed to `ai.get_model(...)` | `anthropic/claude-opus-4-8` |

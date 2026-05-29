@@ -46,4 +46,3 @@ uv run mypy tau            # type-check
 - Approval-gated tools (`write`, `edit`, `bash`) require operator
   confirmation; reads are auto-approved.
 - Sessions persist as JSONL under `.tau/sessions/`.
-- Commit messages for this subdirectory should be prefixed with `[tau]`.
