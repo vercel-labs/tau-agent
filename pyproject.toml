@@ -31,5 +31,15 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [dependency-groups]
 dev = [
     "mypy~=2.1.0",
+    "poethepoet>=0.30",
     "ruff>=0.15.12",
 ]
+
+[tool.poe.tasks]
+format-check = "ruff format --check"
+format = "ruff format"
+lint = "ruff check ."
+lint-fix = "ruff check --fix ."
+type = "mypy tau"
+check = ["format-check", "lint", "type"]
+fix = ["lint-fix", "format"]

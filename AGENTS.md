@@ -32,10 +32,11 @@ uv run tau       # launch the TUI
 ## Linting & type-checking
 
 ```bash
-uv run ruff check .        # lint
-uv run ruff format --check # format check
-uv run mypy tau            # type-check
+uv run poe check    # format check + lint + type-check (matches CI)
 ```
+
+Individual tasks are also available: `uv run poe format-check`,
+`uv run poe lint`, `uv run poe type` (defined in `[tool.poe.tasks]`).
 
 ## Conventions
 
