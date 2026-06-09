@@ -15,11 +15,13 @@ real backend.  Two redirection strategies, picked by available key:
 
 Three scenarios:
 
-1. ``error``  — the API returns an error status for the whole turn.
-   Expect: tau shows an ``error:`` system message and goes idle.
-2. ``cut``    — the SSE stream is severed mid-response.
-   Expect: tau surfaces an error (or completes, if resume logic ever
-   appears) and goes idle.
+1. ``error``  — the API returns an error status for the whole turn
+   (more times than tau's retry budget).  Expect: tau shows an
+   ``error:`` system message and goes idle.
+1b. transient — a single 529, then the API recovers.  Expect: tau
+   retries silently (a retry notice, no ``error:``) and completes.
+2. ``cut``    — the SSE stream is severed mid-response, repeatedly.
+   Expect: tau retries, exhausts, surfaces an error, and goes idle.
 3. recovery   — with faults cleared, a normal turn asks tau to write
    a file; the file's presence proves the session survived.
 
@@ -165,12 +167,13 @@ def _run_turn_expecting_error(prompt: str, errors_before: int) -> bool:
     base._send_text(prompt)
     deadline = time.time() + ERROR_TIMEOUT
     while time.time() < deadline:
-        pane = base._capture().lower()
+        raw = base._capture()
+        pane = raw.lower()
         busy = any(m in pane for m in base.BUSY_MARKERS)
         if (
             not busy
             and base.IDLE_MARKER in pane
-            and pane.count("error:") > errors_before
+            and len(_ERROR_LINE.findall(raw)) > errors_before
         ):
             return True
         time.sleep(base.IDLE_POLL)
@@ -224,6 +227,35 @@ def main() -> int:
             _log("scenario 1: fault was never consumed by a request")
             return 1
         _log("scenario 1: ok — error surfaced, tau returned to idle")
+
+        # Scenario 1b: a single transient 529 — tau should retry
+        # silently and complete the turn without surfacing an error.
+        _log("scenario 1b: single 529, expect silent retry")
+        time.sleep(2.0)  # let the previous turn's bubbles finish painting
+        pane = base._capture()
+        errors, hits = _pane_error_count(), proxy.state.hits
+        retries = pane.count("retrying in")
+        _set_fault(proxy.port, mode="error", status=529, times=1)
+        base._send_text(PROMPT_TRIVIAL)
+        if not base._wait_idle(base.TURN_TIMEOUT):
+            _log("scenario 1b: timed out waiting for tau to finish")
+            _log("final pane:\n" + base._capture())
+            return 1
+        time.sleep(2.0)  # settle: bubbles can paint a frame after idle
+        pane = base._capture()
+        if _pane_error_count() > errors:
+            _log("scenario 1b: error surfaced; expected a silent retry")
+            _log("final pane:\n" + pane)
+            return 1
+        if pane.count("retrying in") <= retries:
+            _log("scenario 1b: no retry notice in the pane")
+            _log("final pane:\n" + pane)
+            return 1
+        if proxy.state.hits != hits + 1:
+            _log("scenario 1b: fault not consumed exactly once")
+            _log(f"request log: {proxy.state.log}")
+            return 1
+        _log("scenario 1b: ok — transient error retried silently")
 
         # Scenario 2: stream severed mid-response.
         _log("scenario 2: SSE stream cut mid-response")

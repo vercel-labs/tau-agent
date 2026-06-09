@@ -25,6 +25,7 @@ import sys
 from typing import Any
 
 import ai
+import ai.errors
 import ai.types.usage
 import pydantic
 import rich.console
@@ -293,12 +294,56 @@ async def chat_loop(app: TauApp) -> None:
         app.session.messages.append(ai.user_message(app.pending.pop(0)))
         app.session.save()
         try:
-            await _run_turn(app)
+            await _run_turn_with_retry(app)
         except asyncio.CancelledError:
             app.show_system("interrupted")
             raise
         except Exception as exc:  # noqa: BLE001 — surface in the UI
             app.show_system(f"error: {_flatten_error(exc)}")
+
+
+MAX_TURN_ATTEMPTS = 3
+RETRY_BASE_DELAY = 2.0  # seconds; doubled per attempt
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Whether a turn error is worth retrying.
+
+    Unwraps ExceptionGroups (the agent loop runs in a TaskGroup) and
+    defers to the library's ``is_retryable`` flag.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_retryable_error(e) for e in exc.exceptions)
+    return isinstance(exc, ai.errors.ProviderAPIError) and exc.is_retryable
+
+
+async def _run_turn_with_retry(app: TauApp) -> None:
+    """Run a turn, retrying transient provider failures with backoff.
+
+    Safe to re-run after a failed attempt: ``_run_turn`` persists
+    completed tool rounds, so a retry resumes from the saved history
+    rather than re-running tools.
+    """
+    for attempt in range(1, MAX_TURN_ATTEMPTS + 1):
+        try:
+            await _run_turn(app)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if attempt == MAX_TURN_ATTEMPTS or not _is_retryable_error(exc):
+                raise
+            delay = RETRY_BASE_DELAY * 2 ** (attempt - 1)
+            app.show_system(
+                f"transient error, retrying in {delay:.0f}s "
+                f"(attempt {attempt}/{MAX_TURN_ATTEMPTS}): "
+                f"{_flatten_error(exc)}"
+            )
+            # Fresh bubbles for the retried attempt — any partially
+            # streamed output from the failed attempt stays visible
+            # above the retry notice.
+            app._reset_turn_bubbles()
+            await asyncio.sleep(delay)
 
 
 async def _run_turn(app: TauApp) -> None:
