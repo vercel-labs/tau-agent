@@ -43,3 +43,4 @@ lint-fix = "ruff check --fix ."
 type = "mypy tau"
 check = ["format-check", "lint", "type"]
 fix = ["lint-fix", "format"]
+smoke = "python tests/smoke_fizzbuzz.py"

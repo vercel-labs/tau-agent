@@ -38,6 +38,18 @@ uv run poe check    # format check + lint + type-check (matches CI)
 Individual tasks are also available: `uv run poe format-check`,
 `uv run poe lint`, `uv run poe type` (defined in `[tool.poe.tasks]`).
 
+## Smoke test
+
+```bash
+uv run poe smoke    # drive tau under tmux to build & edit fizzbuzz
+```
+
+End-to-end check in `tests/smoke_fizzbuzz.py`: launches tau in a tmux
+pane in a temp dir, asks it to implement and then uppercase fizzbuzz,
+and validates by executing the generated file.  Requires `tmux` and an
+API key; skips (exit 77) otherwise.  It is intentionally not part of
+`poe check`/CI since it needs network and costs tokens.
+
 ## Conventions
 
 - Python ≥ 3.12.

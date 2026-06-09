@@ -38,6 +38,17 @@ uv run tau
 Type a message, hit enter.  `ctrl+c` to quit. `ctrl+j` for newlines inside a message.
 Escape interrupts current task.
 
+## Smoke test
+
+```bash
+uv run poe smoke
+```
+
+Drives tau end-to-end under tmux: it asks tau to implement fizzbuzz in
+a temp dir, then to switch the output to all-caps, validating each step
+by running the generated file.  Needs `tmux` and an API key; skips when
+they're unavailable.
+
 ## Environment
 
 | Variable | Description | Default |
