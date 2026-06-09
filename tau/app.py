@@ -349,13 +349,17 @@ async def _run_turn(app: TauApp) -> None:
                     app.on_hook_event(Hook.from_event(event.hook))
         except asyncio.CancelledError:
             interrupted = True
-        # Persist whatever the agent added (assistant + tool turns)
-        # so the next turn sees the full history.  On interruption we
-        # still save the partial state so context isn't lost.
-        app.session.messages = list(stream.messages)
-        app.session.save()
-        app.session.refresh_usage()
-        app._update_usage_display()
+        finally:
+            # Persist whatever the agent added so the next turn sees
+            # the full history — whether the turn finished, errored,
+            # or was interrupted.  ``stream.messages`` is always a
+            # clean prefix: completed assistant+tool rounds only, never
+            # a partial in-flight message or dangling tool_use (the
+            # agent loop only appends to context after each round).
+            app.session.messages = list(stream.messages)
+            app.session.save()
+            app.session.refresh_usage()
+            app._update_usage_display()
     if interrupted:
         raise asyncio.CancelledError
 
