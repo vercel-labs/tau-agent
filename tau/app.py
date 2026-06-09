@@ -1132,9 +1132,12 @@ class TauApp(textual.app.App[None]):
             rendered = self._show_edit_diff(args)
         if not rendered:
             self.transcript.add_bubble("tool", _format_tool_call(name, args))
-        # Next text from the model should start a fresh bubble so
-        # tool output and prose stay visually separated.
+        # Next text/thinking from the model should start fresh bubbles
+        # below the tool output — otherwise post-tool deltas keep
+        # appending to stale bubbles above it and the transcript reads
+        # out of order.
         self._text_bubble = None
+        self._thinking_bubble = None
 
     def _show_edit_diff(self, args: str) -> bool:
         """Try to render an edit call as a diff.  Returns True on success."""
