@@ -221,14 +221,20 @@ class SessionManager:
 
     def refresh_usage(self) -> None:
         """Re-derive cumulative usage from all messages."""
-        total = ai.types.usage.Usage()
-        last: ai.types.usage.Usage | None = None
-        for msg in self.messages:
-            if msg.usage is not None:
-                total = total + msg.usage
-                last = msg.usage
-        self.total_usage = total
-        self.last_usage = last
+        self.total_usage, self.last_usage = derive_usage(self.messages)
+
+
+def derive_usage(
+    messages: list[ai.messages.Message],
+) -> tuple[ai.types.usage.Usage, ai.types.usage.Usage | None]:
+    """Sum usage across *messages*; return (total, last seen)."""
+    total = ai.types.usage.Usage()
+    last: ai.types.usage.Usage | None = None
+    for msg in messages:
+        if msg.usage is not None:
+            total = total + msg.usage
+            last = msg.usage
+    return total, last
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +398,11 @@ async def _run_turn(app: TauApp) -> None:
                     )
                 elif isinstance(event, ai.events.HookEvent):
                     app.on_hook_event(Hook.from_event(event.hook))
+                if (
+                    isinstance(event, ai.events.BaseEvent)
+                    and event.usage is not None
+                ):
+                    app.update_live_usage(stream.messages, event.usage)
         except asyncio.CancelledError:
             interrupted = True
         finally:
@@ -1120,26 +1131,46 @@ class TauApp(textual.app.App[None]):
 
     def _update_usage_display(self) -> None:
         """Show cumulative token usage in the footer bar."""
-        u = self.session.total_usage
-        if u.total_tokens == 0:
+        self._render_usage(self.session.total_usage, self.session.last_usage)
+
+    def update_live_usage(
+        self,
+        messages: list[ai.messages.Message],
+        inflight: ai.types.usage.Usage,
+    ) -> None:
+        """Update the footer mid-turn.
+
+        *messages* covers completed rounds; *inflight* is the latest
+        usage reported for the current stream (not yet in a message).
+        """
+        total, _ = derive_usage(messages)
+        self._render_usage(total + inflight, inflight)
+
+    def _render_usage(
+        self,
+        total: ai.types.usage.Usage,
+        last: ai.types.usage.Usage | None,
+    ) -> None:
+        if total.total_tokens == 0:
             return
         parts: list[str] = []
-        # Approximate current context size: last turn's in + out.
-        if self.session.last_usage is not None:
-            ctx = (
-                self.session.last_usage.input_tokens
-                + self.session.last_usage.output_tokens
-            )
+        # Approximate current context size: last stream's in + out.
+        if last is not None:
+            ctx = last.input_tokens + last.output_tokens
             parts.append(f"ctx: ~{ctx:,}")
         # input_tokens includes cache-read; subtract to show uncached.
-        uncached_in = u.input_tokens - (u.cache_read_tokens or 0)
+        uncached_in = total.input_tokens - (total.cache_read_tokens or 0)
         parts.append(f"in: {uncached_in:,}")
-        if u.cache_read_tokens:
-            parts.append(f"cached: {u.cache_read_tokens:,}")
-        parts.append(f"out: {u.output_tokens:,}")
-        self.query_one("#usage-bar", textual.widgets.Static).update(
-            "  ".join(parts)
-        )
+        if total.cache_read_tokens:
+            parts.append(f"cached: {total.cache_read_tokens:,}")
+        parts.append(f"out: {total.output_tokens:,}")
+        rendered = "  ".join(parts)
+        # Usage is stamped on every stream event; skip the widget
+        # update unless the numbers actually changed.
+        if rendered == self._usage_rendered:
+            return
+        self._usage_rendered = rendered
+        self.query_one("#usage-bar", textual.widgets.Static).update(rendered)
 
     @property
     def transcript(self) -> Transcript:
@@ -1155,6 +1186,7 @@ class TauApp(textual.app.App[None]):
     _text_bubble: Bubble | None = None
     _thinking_bubble: Bubble | None = None
     _tool_result_bubbles: dict[str, Bubble] = {}
+    _usage_rendered: str = ""
 
     def _reset_turn_bubbles(self) -> None:
         self._text_bubble = None
