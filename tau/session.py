@@ -9,16 +9,16 @@ a metadata object (not a Message) carrying session-level info:
 
 Usage:
     # New session (default)
-    uv run python tau.py
+    uv run tau
 
     # Resume the most recent session
-    uv run python tau.py --resume
+    uv run tau --resume
 
     # Resume a specific session by ID (or prefix)
-    uv run python tau.py --session 20250101-120000
+    uv run tau --session 20250101-120000
 
     # List saved sessions
-    uv run python tau.py --list
+    uv run tau --list
 """
 
 from __future__ import annotations
