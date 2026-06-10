@@ -35,8 +35,11 @@ uv sync
 uv run tau
 ```
 
-Type a message, hit enter.  `ctrl+d` to quit. `ctrl+c` clears the prompt.
-`ctrl+j` inserts newlines inside a message. Escape interrupts current task.
+Type a message, hit enter.  `ctrl+c` interrupts a running task (like
+escape), otherwise clears the prompt; on an empty idle prompt it quits.
+`ctrl+d` deletes the character under the cursor, or quits when the
+prompt is empty.  `ctrl+j` inserts newlines inside a message.  Escape
+interrupts current task.
 
 ## Smoke test
 
