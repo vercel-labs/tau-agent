@@ -25,6 +25,7 @@ import sys
 from typing import Any
 
 import ai
+import ai.agents
 import ai.errors
 import ai.types.usage
 import pydantic
@@ -40,10 +41,20 @@ import textual.message
 import textual.widgets
 import textual.worker
 
-from tau import session, tools
+from tau import session, subagent, tools
+
+
+def _normalize_model_id(raw: str) -> str:
+    return raw if ":" in raw else f"gateway:{raw}"
+
 
 _raw_model = os.environ.get("TAU_MODEL", "gateway:anthropic/claude-opus-4.8")
-MODEL_ID = _raw_model if ":" in _raw_model else f"gateway:{_raw_model}"
+MODEL_ID = _normalize_model_id(_raw_model)
+# Model for subagent runs — defaults to the main model; set to
+# something cheaper/faster to make delegated investigations cheap.
+SUBAGENT_MODEL_ID = _normalize_model_id(
+    os.environ.get("TAU_SUBAGENT_MODEL", _raw_model)
+)
 
 EFFORT = os.environ.get("TAU_EFFORT", "high")
 
@@ -73,13 +84,20 @@ ROUTING_PARAMS = {
     for k in {"anthropic", "openai"}
 }
 
-PROVIDER = _provider_slug(MODEL_ID)
-PARAMS = ai.InferenceRequestParams(
-    cache=ai.CacheParams(mode="auto"),
-    reasoning=ai.ReasoningParams(effort=EFFORT),
-    output=OUTPUT_PARAMS.get(PROVIDER),
-    routing=ROUTING_PARAMS.get(PROVIDER),
-)
+
+def _build_params(model_id: str) -> ai.InferenceRequestParams:
+    """Inference params for *model_id* — output/routing are per-provider."""
+    provider = _provider_slug(model_id)
+    return ai.InferenceRequestParams(
+        cache=ai.CacheParams(mode="auto"),
+        reasoning=ai.ReasoningParams(effort=EFFORT),
+        output=OUTPUT_PARAMS.get(provider),
+        routing=ROUTING_PARAMS.get(provider),
+    )
+
+
+PARAMS = _build_params(MODEL_ID)
+SUBAGENT_PARAMS = _build_params(SUBAGENT_MODEL_ID)
 
 
 def _provider_tools(model_id: str) -> list[Any]:
@@ -234,7 +252,18 @@ def derive_usage(
         if msg.usage is not None:
             total = total + msg.usage
             last = msg.usage
+        for part in msg.tool_results:
+            if part.tool_name == "subagent" and not part.is_error:
+                total = total + _subagent_usage(part.result)
     return total, last
+
+
+def _subagent_usage(result: Any) -> ai.types.usage.Usage:
+    """Sum child usage from a subagent result bundle."""
+    total = ai.types.usage.Usage()
+    if not isinstance(result, ai.agents.MessageBundle):
+        return total
+    return sum((msg.usage for msg in result.messages if msg.usage), start=total)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +305,13 @@ def _replay_session(app: TauApp) -> None:
                     result = part.result
                     if part.tool_name == "edit" and isinstance(result, dict):
                         result = result.get("message", result)
+                    elif part.tool_name == "subagent":
+                        # The stored result is the child's whole message
+                        # bundle; render the report the model saw, not
+                        # the raw bundle.
+                        result = ai.agents.MessageAggregator.to_model_input(
+                            result
+                        )
                     app.show_tool_result(result, part.is_error)
     app.show_system(
         f"resumed session {app.session.session_id} "
@@ -352,6 +388,22 @@ async def _run_turn_with_retry(app: TauApp) -> None:
             await asyncio.sleep(delay)
 
 
+def _render_subagent_event(app: TauApp, tool_call_id: str, value: Any) -> None:
+    """Render a child agent's event into the subagent's result bubble.
+
+    Child text streams through; child tool calls show as one line each;
+    child reasoning is dropped.
+    """
+    if isinstance(value, ai.events.TextDelta):
+        app.append_tool_result(tool_call_id, value.chunk)
+    elif isinstance(value, ai.events.ToolEnd):
+        tc = value.tool_call
+        app.append_tool_result(
+            tool_call_id,
+            _format_tool_call(tc.tool_name, tc.tool_args) + "\n",
+        )
+
+
 async def _run_turn(app: TauApp) -> None:
     """Execute a single agent turn, dispatching events to the app."""
     interrupted = False
@@ -372,10 +424,13 @@ async def _run_turn(app: TauApp) -> None:
                         event.tool_call_id,
                     )
                 elif isinstance(event, ai.events.PartialToolCallResult):
-                    if (
-                        event.tool_call_id is not None
-                        and event.tool_name != "edit"
-                    ):
+                    if event.tool_call_id is None or event.tool_name == "edit":
+                        pass
+                    elif event.tool_name == "subagent":
+                        _render_subagent_event(
+                            app, event.tool_call_id, event.value
+                        )
+                    else:
                         app.append_tool_result(
                             event.tool_call_id, str(event.value)
                         )
@@ -1077,7 +1132,13 @@ class TauApp(textual.app.App[None]):
         super().__init__()
         self.model = ai.get_model(MODEL_ID)
         self.agent = ai.agent(
-            tools=[*tools.TOOLS, *_provider_tools(MODEL_ID)],
+            tools=[
+                *tools.TOOLS,
+                subagent.make_subagent_tool(
+                    ai.get_model(SUBAGENT_MODEL_ID), SUBAGENT_PARAMS
+                ),
+                *_provider_tools(MODEL_ID),
+            ],
         )
         self.session = SessionManager(SYSTEM_PROMPT)
         # User messages typed while a turn is streaming.  Drained one at
@@ -1115,8 +1176,14 @@ class TauApp(textual.app.App[None]):
 
     def _start_new_session(self) -> None:
         self.session.start(MODEL_ID)
+        sub = (
+            f"  subagent: {SUBAGENT_MODEL_ID}"
+            if SUBAGENT_MODEL_ID != MODEL_ID
+            else ""
+        )
         self.show_system(
-            f"connected — model: {MODEL_ID}  session: {self.session.session_id}"
+            f"connected — model: {MODEL_ID}{sub}"
+            f"  session: {self.session.session_id}"
         )
 
     def _restore_session(self, path: pathlib.Path) -> None:
