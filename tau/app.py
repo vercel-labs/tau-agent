@@ -1037,7 +1037,12 @@ class TauApp(textual.app.App[None]):
     """
 
     BINDINGS = [
-        textual.binding.Binding("ctrl+c", "quit", "quit", priority=True),
+        textual.binding.Binding(
+            "ctrl+d", "delete_or_quit", "quit", priority=True
+        ),
+        textual.binding.Binding(
+            "ctrl+c", "interrupt_clear_or_quit", "clear prompt", priority=True
+        ),
         textual.binding.Binding(
             "escape", "interrupt", "interrupt", priority=True
         ),
@@ -1262,6 +1267,30 @@ class TauApp(textual.app.App[None]):
             # Dismiss any pending approval prompt and clear the queue.
             self._hook_queue.clear()
             self._dismiss_active_prompt()
+
+    def action_delete_or_quit(self) -> None:
+        """Ctrl+D: quit on an empty prompt (shell EOF); otherwise keep
+        the TextArea default of deleting the character under the
+        cursor (readline delete-char)."""
+        composer = self.query_one("#composer", Composer)
+        if not composer.text:
+            self.exit()
+            return
+        composer.action_delete_right()
+
+    def action_interrupt_clear_or_quit(self) -> None:
+        """Ctrl+C: interrupt a running turn (like ESC); otherwise clear
+        the prompt; on an already-empty idle prompt, quit."""
+        if self._turn_worker is not None:
+            self.action_interrupt()
+            return
+        composer = self.query_one("#composer", Composer)
+        if not composer.text:
+            self.exit()
+            return
+        composer.text = ""
+        composer.refresh_height()
+        composer.focus()
 
     # ------------------------------------------------------------------
     # Hook plumbing
