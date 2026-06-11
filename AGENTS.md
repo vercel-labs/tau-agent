@@ -95,6 +95,26 @@ Gotchas, learned the hard way:
   edge checks), not by eyeballing the screenshot — small alignment
   defects are easy to miss, especially in your own work.
 
+For pixel-true captures — real font rasterization through a real
+terminal emulator's rendering path — use `tests/screenshot_x11.py`
+instead.  It renders the tmux session in a terminal under a headless
+X server and grabs the actual window pixels:
+
+```bash
+uv run python tests/screenshot_x11.py -L tau-dev tau /tmp/shot.png
+```
+
+Needs `Xvfb` and ImageMagick (`xvfb`/`imagemagick` packages); skips
+with exit 77 when missing.  The emulator is configurable: `--terminal
+xterm` (default) or `urxvt`, or any command template with a
+`{command}` placeholder, e.g. `--terminal 'alacritty -e sh -c
+{command}'` (the emulator must export `$WINDOWID` to its child).
+This is the ground-truth instrument: prefer it when investigating
+rendering questions (fonts, contrast, colors); use the SVG tool for
+quick looks and docs.  Note it shows tau on the emulator's *real*
+default background — which is how the white-xterm contrast issue
+with dark-on-dark tool panels was found.
+
 ## Conventions
 
 - Python ≥ 3.12.
