@@ -266,6 +266,30 @@ def _subagent_usage(result: Any) -> ai.types.usage.Usage:
     return sum((msg.usage for msg in result.messages if msg.usage), start=total)
 
 
+def _format_subagent_replay(result: Any) -> str | None:
+    """Rebuild the live subagent bubble text from a stored bundle.
+
+    Live rendering streams the child's tool calls (one line each) and
+    its text into the result bubble; the stored bundle carries the
+    child's full message list, so replay reconstructs the same view
+    rather than showing only the (truncated) final report.
+    """
+    if not isinstance(result, ai.agents.MessageBundle):
+        return None  # e.g. an error-result payload
+    out: list[str] = []
+    for msg in result.messages:
+        if msg.role != "assistant":
+            continue
+        for part in msg.parts:
+            if isinstance(part, ai.messages.TextPart):
+                out.append(part.text)
+            elif isinstance(part, ai.messages.ToolCallPart):
+                out.append(
+                    _format_tool_call(part.tool_name, part.tool_args) + "\n"
+                )
+    return "".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
@@ -302,16 +326,18 @@ def _replay_session(app: TauApp) -> None:
                             "tool-result",
                             renderable=diff,
                         )
+                    if part.tool_name == "subagent":
+                        # The stored result is the child's whole message
+                        # bundle; rebuild the live view (child tool-call
+                        # lines plus the report, untruncated) instead of
+                        # showing only the final text.
+                        replayed = _format_subagent_replay(part.result)
+                        if replayed is not None:
+                            app.transcript.add_bubble("tool-result", replayed)
+                            continue
                     result = part.result
                     if part.tool_name == "edit" and isinstance(result, dict):
                         result = result.get("message", result)
-                    elif part.tool_name == "subagent":
-                        # The stored result is the child's whole message
-                        # bundle; render the report the model saw, not
-                        # the raw bundle.
-                        result = ai.agents.MessageAggregator.to_model_input(
-                            result
-                        )
                     app.show_tool_result(result, part.is_error)
     app.show_system(
         f"resumed session {app.session.session_id} "
