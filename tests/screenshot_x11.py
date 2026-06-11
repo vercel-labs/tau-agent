@@ -81,6 +81,21 @@ PRESETS = {
         "-c",
         "{command}",
     ],
+    # --disable-server is required: without it the launcher hands off
+    # to a terminal server process and exits, which looks like a
+    # launch failure (and the real window outlives our teardown).
+    "xfce4-terminal": [
+        "xfce4-terminal",
+        "--disable-server",
+        "--hide-menubar",
+        "--hide-scrollbar",
+        "--geometry={cols}x{rows}",
+        "--font={font} {size}",
+        "-x",
+        "sh",
+        "-c",
+        "{command}",
+    ],
 }
 
 
@@ -309,8 +324,8 @@ def main() -> None:
         "--terminal",
         default="xterm",
         help=(
-            "terminal preset (xterm, urxvt) or command template with "
-            "a {command} placeholder"
+            "terminal preset (" + ", ".join(sorted(PRESETS)) + ") or "
+            "command template with a {command} placeholder"
         ),
     )
     parser.add_argument(

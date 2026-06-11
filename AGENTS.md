@@ -105,10 +105,11 @@ uv run python tests/screenshot_x11.py -L tau-dev tau /tmp/shot.png
 ```
 
 Needs `Xvfb` and ImageMagick (`xvfb`/`imagemagick` packages); skips
-with exit 77 when missing.  The emulator is configurable: `--terminal
-xterm` (default) or `urxvt`, or any command template with a
-`{command}` placeholder, e.g. `--terminal 'alacritty -e sh -c
-{command}'` (the emulator must export `$WINDOWID` to its child).
+with exit 77 when missing.  The emulator is configurable: presets
+`xterm` (default), `urxvt`, and `xfce4-terminal`, or any command
+template with a `{command}` placeholder, e.g. `--terminal 'alacritty
+-e sh -c {command}'` (the emulator must export `$WINDOWID` to its
+child; quote template tokens that contain spaces).
 This is the ground-truth instrument: prefer it when investigating
 rendering questions (fonts, contrast, colors); use the SVG tool for
 quick looks and docs.  Note it shows tau on the emulator's *real*
