@@ -1076,7 +1076,7 @@ class TauApp(textual.app.App[None]):
     ) -> None:
         super().__init__()
         self.model = ai.get_model(MODEL_ID)
-        self.agent = ai.agent(
+        self.agent = ai.Agent(
             tools=[*tools.TOOLS, *_provider_tools(MODEL_ID)],
         )
         self.session = SessionManager(SYSTEM_PROMPT)
