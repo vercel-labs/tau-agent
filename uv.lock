@@ -8,8 +8,8 @@ resolution-markers = [
 
 [[package]]
 name = "ai"
-version = "0.2.1.dev29+aa158a9"
-source = { git = "https://github.com/vercel-labs/ai-python.git?rev=aa158a9e244c288982346da91f7e53fc872360bf#aa158a9e244c288982346da91f7e53fc872360bf" }
+version = "0.2.2.dev25+faafcc0"
+source = { git = "https://github.com/vercel-labs/ai-python?branch=main#faafcc0d3fd3f43f4dea9c8dddc599df56f18019" }
 dependencies = [
     { name = "httpx" },
     { name = "modelsdotdev" },
@@ -701,7 +701,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ai", extras = ["anthropic", "openai"], git = "https://github.com/vercel-labs/ai-python.git?rev=aa158a9e244c288982346da91f7e53fc872360bf" },
+    { name = "ai", extras = ["anthropic", "openai"], git = "https://github.com/vercel-labs/ai-python?branch=main" },
     { name = "textual", specifier = ">=3.0" },
 ]
 

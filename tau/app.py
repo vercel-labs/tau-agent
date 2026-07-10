@@ -356,7 +356,10 @@ async def _run_turn(app: TauApp) -> None:
     """Execute a single agent turn, dispatching events to the app."""
     interrupted = False
     async with app.agent.run(
-        app.model, app.session.messages, params=PARAMS
+        app.model,
+        app.session.messages,
+        params=PARAMS,
+        hook_registry=app._hook_registry,
     ) as stream:
         try:
             async for event in stream:
@@ -730,12 +733,20 @@ class ApprovalTracker:
             PromptOption("a", "always_all", "always all"),
         ]
 
-    def resolve(self, hook: Hook, decision: str) -> bool:
+    def resolve(
+        self,
+        hook: Hook,
+        decision: str,
+        *,
+        registry: ai.HookRegistry,
+    ) -> bool:
         """Resolve a hook: update approval state, signal the library.
 
         *decision* is one of ``'yes'``, ``'no'``, ``'always_this'``,
         ``'allow_dir'``, ``'always_all'``.  Returns whether the hook
-        was granted.
+        was granted.  *registry* holds the turn's hooks — resolutions
+        may arrive from Textual's message pump, outside the run's
+        context, so it must be passed explicitly.
         """
         # Remember lasting decisions.
         if decision == "always_this":
@@ -760,6 +771,7 @@ class ApprovalTracker:
                 granted=granted,
                 reason="operator approved" if granted else "operator denied",
             ),
+            registry=registry,
         )
         return granted
 
@@ -1076,7 +1088,7 @@ class TauApp(textual.app.App[None]):
     ) -> None:
         super().__init__()
         self.model = ai.get_model(MODEL_ID)
-        self.agent = ai.agent(
+        self.agent = ai.Agent(
             tools=[*tools.TOOLS, *_provider_tools(MODEL_ID)],
         )
         self.session = SessionManager(SYSTEM_PROMPT)
@@ -1091,6 +1103,10 @@ class TauApp(textual.app.App[None]):
         self._hook_queue: list[tuple[Hook, list[PromptOption]]] = []
         self._active_hook: Hook | None = None
         self._approval = ApprovalTracker()
+        # All runs share this app-owned registry, so hooks can be
+        # resolved from Textual's message pump, outside the run's
+        # context.
+        self._hook_registry = ai.HookRegistry()
         self._turn_worker: textual.worker.Worker[None] | None = None
         self._resume_path = resume_path
 
@@ -1330,7 +1346,9 @@ class TauApp(textual.app.App[None]):
 
     def _resolve_hook(self, hook: Hook, decision: str) -> None:
         """Resolve a hook and show a transcript note."""
-        granted = self._approval.resolve(hook, decision)
+        granted = self._approval.resolve(
+            hook, decision, registry=self._hook_registry
+        )
         self.show_system(f"{'approved' if granted else 'denied'}: {hook.tool}")
 
     def on_hook_event(self, hook: Hook) -> None:
