@@ -402,7 +402,7 @@ async def _run_turn(app: TauApp) -> None:
                 elif isinstance(event, ai.events.HookEvent):
                     app.on_hook_event(Hook.from_event(event.hook))
                 if (
-                    isinstance(event, ai.events.BaseEvent)
+                    isinstance(event, ai.events.ModelEvent)
                     and event.usage is not None
                 ):
                     app.update_live_usage(stream.messages, event.usage)
