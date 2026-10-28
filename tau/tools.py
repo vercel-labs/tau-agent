@@ -19,8 +19,7 @@ import asyncio
 import dataclasses
 import pathlib
 import re
-from collections.abc import AsyncGenerator
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
 import ai
 import ai.agents
@@ -390,8 +389,7 @@ class EditResult(pydantic.BaseModel):
     """Structured result from the edit tool.
 
     Persisted in the session so the UI can render a diff on restore.
-    The model only sees ``message`` via the aggregator's
-    ``to_model_input``.
+    The model only sees ``message`` (see ``_edit_model_input``).
     """
 
     message: str
@@ -399,38 +397,18 @@ class EditResult(pydantic.BaseModel):
     new_content: str
 
 
-class _EditAggregator(
-    ai.types.events.Aggregator[EditResult, EditResult, str],
-):
-    def __init__(self) -> None:
-        self._result: EditResult | None = None
-
-    def feed(self, item: EditResult) -> None:
-        self._result = item
-
-    def snapshot(self) -> EditResult:
-        assert self._result is not None
-        return self._result
-
-    @classmethod
-    def to_model_input(cls, snapshot: EditResult) -> str:
-        # COMPAT: Check if it is a str because old sessions stored it
-        # that way. Probably remove this.
-        if isinstance(snapshot, str):
-            return snapshot
-        if isinstance(snapshot, dict):
-            return snapshot.get("message", str(snapshot))
-        return snapshot.message
+def _edit_model_input(result: EditResult | dict[str, Any] | str) -> str:
+    # Results restored from a session arrive as plain JSON (a dict),
+    # and very old sessions stored just the message string.
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return str(result.get("message", result))
+    return result.message
 
 
-type _EditTool = Annotated[
-    AsyncGenerator[EditResult],
-    ai.agents.Aggregate(_EditAggregator),
-]
-
-
-@ai.tool(require_approval=True)
-async def edit(path: str, edits: list[TextEdit]) -> _EditTool:
+@ai.tool(require_approval=True, to_model_input=_edit_model_input)
+async def edit(path: str, edits: list[TextEdit]) -> EditResult:
     """Edit a single file using exact text replacement.
 
     Every edits[].oldText must match a unique, non-overlapping region of
@@ -449,7 +427,7 @@ async def edit(path: str, edits: list[TextEdit]) -> _EditTool:
     old_content = p.read_text(encoding="utf-8")
     new_content = edit_string(old_content, edits, path)
     p.write_text(new_content, encoding="utf-8")
-    yield EditResult(
+    return EditResult(
         message=f"Successfully replaced {len(edits)} block(s) in {path}.",
         old_content=old_content,
         new_content=new_content,

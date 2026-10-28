@@ -375,10 +375,7 @@ async def _run_turn(app: TauApp) -> None:
                         event.tool_call_id,
                     )
                 elif isinstance(event, ai.events.PartialToolCallResult):
-                    if (
-                        event.tool_call_id is not None
-                        and event.tool_name != "edit"
-                    ):
+                    if event.tool_call_id is not None:
                         app.append_tool_result(
                             event.tool_call_id, str(event.value)
                         )
