@@ -42,7 +42,7 @@ import textual.worker
 
 from tau import session, tools
 
-_raw_model = os.environ.get("TAU_MODEL", "gateway:anthropic/claude-opus-4.8")
+_raw_model = os.environ.get("TAU_MODEL", "gateway:anthropic/claude-opus-5.5")
 MODEL_ID = _raw_model if ":" in _raw_model else f"gateway:{_raw_model}"
 
 EFFORT = os.environ.get("TAU_EFFORT", "high")
