@@ -19,6 +19,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["tau"]
 
+[tool.uv.sources]
+ai = { git = "https://github.com/vercel-labs/ai-python", rev = "c0c72eeca22d1399fc8859081fba5d973370899b" }
+
 [tool.ruff]
 line-length = 80
 extend-exclude = ["tau/run_sandbox.py"]

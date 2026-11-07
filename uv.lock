@@ -8,17 +8,13 @@ resolution-markers = [
 
 [[package]]
 name = "ai"
-version = "0.8.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.8.1.dev14+c0c72ee"
+source = { git = "https://github.com/vercel-labs/ai-python?rev=c0c72eeca22d1399fc8859081fba5d973370899b#c0c72eeca22d1399fc8859081fba5d973370899b" }
 dependencies = [
     { name = "httpx2" },
     { name = "modelsdotdev" },
     { name = "pydantic" },
     { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d7/ea/06b154054189fdc14116246f0231df0e28e138cc1627c3aab4b2a47b137e/ai-0.8.0.tar.gz", hash = "sha256:ff4e8541f990e15839e9c86b0285d435fe60516eb430db8ecb6e2ba5a9cf79b1", size = 1234217, upload-time = "2026-09-29T22:39:28.144Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/52/50/caf9a78a781777655e9cc8f0431df3540fe18f5568572387e2af030e1abb/ai-0.8.0-py3-none-any.whl", hash = "sha256:d2ba66992d3117996d37a96c9a2a4f36bfef16c862bfac5c311a963c3e084903", size = 213685, upload-time = "2026-09-29T22:39:26.197Z" },
 ]
 
 [package.optional-dependencies]
@@ -1025,7 +1021,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ai", extras = ["anthropic", "openai"], specifier = ">=0.8.0" },
+    { name = "ai", extras = ["anthropic", "openai"], git = "https://github.com/vercel-labs/ai-python?rev=c0c72eeca22d1399fc8859081fba5d973370899b" },
     { name = "textual", specifier = ">=3.0" },
     { name = "vercel", specifier = ">=0.12.2" },
 ]
