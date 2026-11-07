@@ -691,8 +691,12 @@ class SandboxWorker(BaseWorker):
 
     async def __aexit__(self, *exc_info):
         await self._stop()
-        await self._cmd.stdin.aclose()
-        await self._cmd.wait()
+        try:
+            await self._cmd.stdin.aclose()
+            await self._cmd.wait()
+        except Exception as exc:
+            if not _sandbox_stopped(exc):
+                raise
         await self._stdout.aclose()
         await self._cmd.stderr.aclose()
 
@@ -700,6 +704,15 @@ class SandboxWorker(BaseWorker):
         returncode = await self._cmd.wait()
         stderr = await self._cmd.stderr.read()
         return f"worker exited with {returncode}\n{stderr}"
+
+
+def _sandbox_stopped(exc):
+    """Whether ``exc`` (or its cause) says the sandbox is already gone."""
+    while exc is not None:
+        if getattr(exc, "code", None) == "sandbox_stopped":
+            return True
+        exc = exc.__cause__
+    return False
 
 
 class PtySandboxWorker(SandboxWorker):
