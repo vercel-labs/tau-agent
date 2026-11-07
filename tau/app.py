@@ -40,7 +40,7 @@ import textual.message
 import textual.widgets
 import textual.worker
 
-from tau import session, tools
+from tau import sandbox, session, tools
 
 _raw_model = os.environ.get("TAU_MODEL", "gateway:anthropic/claude-opus-5.5")
 MODEL_ID = _raw_model if ":" in _raw_model else f"gateway:{_raw_model}"
@@ -1082,12 +1082,14 @@ class TauApp(textual.app.App[None]):
         self,
         *,
         resume_path: pathlib.Path | None = None,
-        agent: ai.Agent | None = None,
+        require_approval: bool | None = None,
     ) -> None:
         super().__init__()
         self.model = ai.get_model(MODEL_ID)
-        self.agent = agent or ai.Agent(
-            tools=[*tools.TOOLS, *_provider_tools(MODEL_ID)],
+        self.agent = sandbox.SandboxAgent(
+            sandbox_tools=tools.TOOLS,
+            extra_tools=_provider_tools(MODEL_ID),
+            require_approval=require_approval,
         )
         self.session = SessionManager(SYSTEM_PROMPT)
         # User messages typed while a turn is streaming.  Drained one at
@@ -1485,16 +1487,10 @@ def main() -> None:
 
 
 async def _run_sandboxed(resume_path: pathlib.Path | None) -> None:
-    from tau import sandbox
-
     print("starting sandbox…", file=sys.stderr)
-    async with sandbox.sandbox_worker() as worker:
-        agent = sandbox.SandboxAgent(
-            worker,
-            sandbox_tools=tools.TOOLS,
-            extra_tools=_provider_tools(MODEL_ID),
-        )
-        await TauApp(resume_path=resume_path, agent=agent).run_async()
+    async with sandbox.sandbox_worker():
+        app = TauApp(resume_path=resume_path, require_approval=False)
+        await app.run_async()
 
 
 if __name__ == "__main__":

@@ -1,13 +1,16 @@
 """Run tau's tools in a remote Vercel sandbox.
 
-The repo is copied into the sandbox and a ``run_sandbox`` worker is
-started there; ``SandboxAgent`` forwards every tool call to it, so the
-tools see the sandbox's filesystem and run its shell commands.
+``sandbox_worker()`` copies the repo into a sandbox, starts a
+``run_sandbox`` worker there, and makes it the ambient worker.
+``SandboxAgent``'s tools run in the ambient worker when there is one,
+so they see the sandbox's filesystem and run its shell commands, and
+run locally otherwise.
 """
 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import importlib
@@ -24,9 +27,12 @@ from tau import run_sandbox
 
 _REPO_ROOT = pathlib.Path(run_sandbox.__file__).parent.parent
 
+_worker: contextvars.ContextVar[run_sandbox.BaseWorker | None] = (
+    contextvars.ContextVar("tau_sandbox_worker", default=None)
+)
+
 
 def _call_tool(module: str, qualname: str, /, **kwargs: Any) -> Any:
-    """Runs in the sandbox worker."""
     obj: Any = importlib.import_module(module)
     for attr in qualname.split("."):
         obj = getattr(obj, attr)
@@ -35,34 +41,57 @@ def _call_tool(module: str, qualname: str, /, **kwargs: Any) -> Any:
     return obj(**kwargs)
 
 
+def _dispatch(
+    module: str, qualname: str, streaming: bool, /, **kwargs: Any
+) -> Any:
+    worker = _worker.get()
+    if worker is None:
+        return _call_tool(module, qualname, **kwargs)
+    call = worker.iterate if streaming else worker.run
+    return call(_call_tool, module, qualname, **kwargs)
+
+
 class SandboxAgent(ai.Agent):
-    """An agent that runs ``sandbox_tools``, unapproved, in a sandbox worker."""
+    """An agent that runs ``sandbox_tools`` in the ambient sandbox worker.
+
+    ``require_approval``, if not None, overrides the tools' own setting.
+    """
 
     def __init__(
         self,
-        worker: run_sandbox.BaseWorker,
         *,
         sandbox_tools: Sequence[ai.agents.agent.AgentTool],
         extra_tools: Sequence[ai.agents.agent.AgentTool | ai.Tool] = (),
+        require_approval: bool | None = None,
     ) -> None:
-        remote = []
+        wrapped = []
         for t in sandbox_tools:
-            call = worker.run if t.aggregator is None else worker.iterate
-            remote.append(
+            tool = t.tool
+            if require_approval is not None:
+                tool = tool.model_copy(
+                    update={"require_approval": require_approval}
+                )
+            wrapped.append(
                 dataclasses.replace(
                     t,
-                    tool=t.tool.model_copy(update={"require_approval": False}),
+                    tool=tool,
                     fn=functools.partial(
-                        call, _call_tool, t.fn.__module__, t.fn.__qualname__
+                        _dispatch,
+                        t.fn.__module__,
+                        t.fn.__qualname__,
+                        t.aggregator is not None,
                     ),
                 )
             )
-        super().__init__(tools=[*remote, *extra_tools])
+        super().__init__(tools=[*wrapped, *extra_tools])
 
 
 @contextlib.asynccontextmanager
 async def sandbox_worker() -> AsyncIterator[run_sandbox.SandboxWorker]:
-    """Create a sandbox with a copy of the repo and a worker running in it."""
+    """Create a sandbox running a worker on a copy of the repo.
+
+    The worker is the ambient sandbox worker until exit.
+    """
     async with (
         session(),
         sandbox.create_sandbox() as box,
@@ -70,4 +99,8 @@ async def sandbox_worker() -> AsyncIterator[run_sandbox.SandboxWorker]:
             box, run_sandbox.__file__, src_dir=str(_REPO_ROOT)
         ) as worker,
     ):
-        yield worker
+        token = _worker.set(worker)
+        try:
+            yield worker
+        finally:
+            _worker.reset(token)
