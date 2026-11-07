@@ -1490,7 +1490,9 @@ async def _run_sandboxed(resume_path: pathlib.Path | None) -> None:
     print("starting sandbox…", file=sys.stderr)
     async with sandbox.sandbox_worker() as worker:
         agent = sandbox.SandboxAgent(
-            worker, extra_tools=_provider_tools(MODEL_ID)
+            worker,
+            sandbox_tools=tools.TOOLS,
+            extra_tools=_provider_tools(MODEL_ID),
         )
         await TauApp(resume_path=resume_path, agent=agent).run_async()
 

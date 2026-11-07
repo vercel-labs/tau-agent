@@ -9,80 +9,55 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
+import importlib
 import pathlib
 from collections.abc import AsyncIterator, Sequence
-from typing import Any, overload
+from typing import Any
 
 import ai
 import ai.agents.agent
-import ai.types.messages
 from vercel import sandbox
 from vercel.api import session
 
-from tau import run_sandbox, tools
-
-_TOOLS_BY_NAME = {t.name: t for t in tools.TOOLS}
+from tau import run_sandbox
 
 _REPO_ROOT = pathlib.Path(run_sandbox.__file__).parent.parent
 
 
-def _call_tool(name: str, kwargs: dict[str, Any]) -> Any:
+def _call_tool(module: str, qualname: str, /, **kwargs: Any) -> Any:
     """Runs in the sandbox worker."""
-    return _TOOLS_BY_NAME[name].fn(**kwargs)
+    obj: Any = importlib.import_module(module)
+    for attr in qualname.split("."):
+        obj = getattr(obj, attr)
+    if isinstance(obj, ai.agents.agent.AgentTool):
+        obj = obj.fn
+    return obj(**kwargs)
 
 
 class SandboxAgent(ai.Agent):
-    """An agent whose tools all run in a sandbox worker, unapproved."""
+    """An agent that runs ``sandbox_tools``, unapproved, in a sandbox worker."""
 
     def __init__(
         self,
         worker: run_sandbox.BaseWorker,
         *,
+        sandbox_tools: Sequence[ai.agents.agent.AgentTool],
         extra_tools: Sequence[ai.agents.agent.AgentTool | ai.Tool] = (),
     ) -> None:
-        self._worker = worker
-        remote = [
-            dataclasses.replace(t, fn=self._remote_fn(t)) for t in tools.TOOLS
-        ]
-        super().__init__(tools=[*remote, *extra_tools])
-
-    def _remote_fn(self, tool: ai.agents.agent.AgentTool) -> Any:
-        name = tool.name
-        if tool.aggregator is not None:
-
-            def stream(**kwargs: Any) -> Any:
-                return self._worker.iterate(_call_tool, name, kwargs)
-
-            return stream
-
-        def call(**kwargs: Any) -> Any:
-            return self._worker.run(_call_tool, name, kwargs)
-
-        return call
-
-    @overload
-    def resolve(
-        self, tool_part: ai.types.messages.ToolCallPart
-    ) -> ai.agents.agent.ToolCall: ...
-    @overload
-    def resolve(
-        self, tool_part: Sequence[ai.types.messages.ToolCallPart]
-    ) -> list[ai.agents.agent.ToolCall]: ...
-
-    def resolve(
-        self,
-        tool_part: ai.types.messages.ToolCallPart
-        | Sequence[ai.types.messages.ToolCallPart],
-    ) -> ai.agents.agent.ToolCall | list[ai.agents.agent.ToolCall]:
-        # Skips the approval gate that ``ToolResolver.resolve`` adds.
-        if not isinstance(tool_part, ai.types.messages.ToolCallPart):
-            return [self.resolve(tp) for tp in tool_part]
-        tool = self._tool_resolver.get(tool_part.tool_name)
-        if tool is None:
-            raise KeyError(
-                f"No agent executor registered for tool {tool_part.tool_name!r}"
+        remote = []
+        for t in sandbox_tools:
+            call = worker.run if t.aggregator is None else worker.iterate
+            remote.append(
+                dataclasses.replace(
+                    t,
+                    tool=t.tool.model_copy(update={"require_approval": False}),
+                    fn=functools.partial(
+                        call, _call_tool, t.fn.__module__, t.fn.__qualname__
+                    ),
+                )
             )
-        return ai.agents.agent.BoundToolCall(part=tool_part, tool=tool)
+        super().__init__(tools=[*remote, *extra_tools])
 
 
 @contextlib.asynccontextmanager
