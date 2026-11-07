@@ -1082,10 +1082,11 @@ class TauApp(textual.app.App[None]):
         self,
         *,
         resume_path: pathlib.Path | None = None,
+        agent: ai.Agent | None = None,
     ) -> None:
         super().__init__()
         self.model = ai.get_model(MODEL_ID)
-        self.agent = ai.Agent(
+        self.agent = agent or ai.Agent(
             tools=[*tools.TOOLS, *_provider_tools(MODEL_ID)],
         )
         self.session = SessionManager(SYSTEM_PROMPT)
@@ -1434,6 +1435,12 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="List saved sessions and exit.",
     )
+    parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        default=False,
+        help="Run all tools, unapproved, in a remote Vercel sandbox.",
+    )
     return parser.parse_args()
 
 
@@ -1471,7 +1478,21 @@ def main() -> None:
             print(f"Session not found: {args.session}", file=sys.stderr)
             sys.exit(1)
 
-    TauApp(resume_path=resume_path).run()
+    if args.sandbox:
+        asyncio.run(_run_sandboxed(resume_path))
+    else:
+        TauApp(resume_path=resume_path).run()
+
+
+async def _run_sandboxed(resume_path: pathlib.Path | None) -> None:
+    from tau import sandbox
+
+    print("starting sandbox…", file=sys.stderr)
+    async with sandbox.sandbox_worker() as worker:
+        agent = sandbox.SandboxAgent(
+            worker, extra_tools=_provider_tools(MODEL_ID)
+        )
+        await TauApp(resume_path=resume_path, agent=agent).run_async()
 
 
 if __name__ == "__main__":

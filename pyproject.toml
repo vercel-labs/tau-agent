@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "ai[anthropic,openai]>=0.8.0",
     "textual>=3.0",
+    "vercel>=0.12.2",
 ]
 
 [project.scripts]
@@ -20,6 +21,7 @@ packages = ["tau"]
 
 [tool.ruff]
 line-length = 80
+extend-exclude = ["tau/run_sandbox.py"]
 target-version = "py312"
 
 [tool.ruff.lint]
