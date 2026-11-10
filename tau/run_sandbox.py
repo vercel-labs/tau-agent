@@ -44,6 +44,7 @@ import subprocess
 import sys
 import threading
 import types
+import typing
 from abc import ABC, abstractmethod
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -55,26 +56,7 @@ from anyio.streams.buffered import BufferedByteReceiveStream
 _LENGTH = struct.Struct(">Q")
 
 
-######
-
-import functools
-import types
-
-def _copy(inner, *, outer):
-    if outer.done():
-        return
-    if inner.cancelled():
-        outer.cancel()
-    else:
-        exc = inner.exception()
-        if exc is not None:
-            outer.set_exception(exc)
-        else:
-            outer.set_result(inner.result())
-
-
-@types.coroutine
-def _protected_asyncio(ax):
+async def protected[T](arg: typing.Awaitable[T]) -> T:
     '''Wait for a future, deferring cancellation until it is complete.
 
     If you do
@@ -90,146 +72,73 @@ def _protected_asyncio(ax):
     the cancellation state *will* remain armed, so that cancellation
     should be delivered the next time it blocks
 
-    If anyio is imported, we will enter an anyio CancelScope.
-    Annoyingly we can't do the optimization where we don't create the
-    scope until failure because checkpoint_if_cancelled() screws us.
-    I THINK THERE IS SOMETHING FRUMIOUS WE COULD DO THOUGH!!
+    If anyio is imported, we will enter an anyio CancelScope. As an
+    optimization, we only do it *after* but only *after* we take a
+    CancelledError.
 
     This is useful for shielding cleanup code from cancellation,
     especially code in finally blocks.
 
-    ===
-
-    The nice things about this version are:
-      * It is the fastest I think, at least for no-ops...
-      * Cancelling *all* tasks doesn't kill the inside
-
-    The downside is:
-      * Introspection gets totally horked.
-      * Kind of horrific.
-
     '''
-
-    # GET_AWAITABLE (PEP 492)
-    if isinstance(ax, types.GeneratorType):
-        if not ax.gi_code.co_flags & inspect.CO_ITERABLE_COROUTINE:
-            raise TypeError("object can't be used in 'await' expression")
-        _i = ax
-    else:
-        try:
-            _await = type(ax).__await__
-        except AttributeError:
-            raise TypeError("object can't be used in 'await' expression") from None
-        _i = _await(ax)
-
-    # ``_r = yield from _i`` per PEP 380, with eyes
-    scope = None
-    cancelled = None
-    _n = 0
-    cb = None
-
-    anyio = sys.modules.get("anyio")
-    if anyio:
-        scope = anyio.CancelScope(shield=True)
-        scope.__enter__()
-
+    loop = None
     try:
-        _y = next(_i)
-    except StopIteration as _e:
-        _r = _e.value
-    else:
-        while 1:
-            cb = None
-            real_y = _y
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
 
-            if real_y:
-                _y = asyncio.Future()
-                # Start the iterator or we will get whining
-                next(iter(_y))
-                # XXX: introspection?
-                if real_y.done():
-                    # make it already done if it is don -- eanyio won't
-                    # cancel a finished future
-                    _copy(real_y, outer=_y)
-                else:
-                    cb = functools.partial(_copy, outer=_y)
-                    real_y.add_done_callback(cb)
+    if not loop:
+        with anyio.CancelScope(shield=True):
+            return await arg
 
+    done = False
+    result: T | None = None
+    exc = None
+    waiter: asyncio.Future[None] | None = None
+
+    async def go():
+        nonlocal done, result, exc
+        try:
+            result = await arg
+        except BaseException as e:
+            exc = e
+            # swallow
+        finally:
+            done = True
+            if waiter and not waiter.done():
+                waiter.set_result(None)
+
+    task = asyncio.Task(go(), loop=loop, eager_start=True)
+
+    cancelled = None
+    scope = None
+    try:
+        while not done:
             try:
-                _s = yield _y
-            except GeneratorExit as _e:
-                try:
-                    _m = _i.close
-                except AttributeError:
-                    pass
-                else:
-                    _m()
-                raise _e
+                waiter = asyncio.Future()
+                await waiter
             except asyncio.CancelledError as cex:
-                # Swallow it and fucking go
-                _y = real_y
-                if real_y:
-                    real_y.remove_done_callback(cb)
-                cancelled = cex
-                continue
+                if not scope and (anyio := sys.modules.get("anyio")):
+                    scope = anyio.CancelScope(shield=True)
+                    scope.__enter__()
 
-            except BaseException as _e:
-                try:
-                    _m = _i.throw
-                except AttributeError:
-                    raise _e
-                else:
-                    try:
-                        _y = _m(_e)
-                    except StopIteration as _e2:
-                        _r = _e2.value
-                        break
-            else:
-                try:
-                    if _s is None:
-                        _y = next(_i)
-                    else:
-                        _y = _i.send(_s)
-                except StopIteration as _e:
-                    _r = _e.value
-                    break
+                cancelled = cex
     finally:
         if scope:
             scope.__exit__(None, None, None)
-        if cancelled:
-            current = asyncio.current_task()
-            assert current
-            # For asyncio cancellations, it is edge triggered, so
-            # we need to recancel the task, so that it gets
-            # delivered, but then also *uncancel* it, so the count
-            # doesn't go up.
-            current.cancel(cancelled.args[0] if cancelled.args else None)
-            current.uncancel()
 
-    return _r
+    if cancelled:
+        current = asyncio.current_task()
+        assert current
+        # For asyncio cancellations, it is edge triggered, so
+        # we need to recancel the task, so that it gets
+        # delivered, but then also *uncancel* it, so the count
+        # doesn't go up.
+        current.cancel(cancelled.args[0] if cancelled.args else None)
+        current.uncancel()
 
-
-#######
-
-
-
-async def _protected_anyio(ax):
-    with anyio.CancelScope(shield=True):
-        return await ax
-
-
-def protected(ax):
-    """Await ``ax`` to completion, delivering any cancellation afterwards.
-
-    Under asyncio this also holds off native cancellation (``task.cancel()``,
-    ``asyncio.timeout``), which an anyio shield does not; under any other
-    event loop it is an ``anyio.CancelScope(shield=True)``.
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return _protected_anyio(ax)
-    return _protected_asyncio(ax)
+    if exc:
+        raise exc
+    return result  # type: ignore[return-value]
 
 
 def encode_reply(request_id, reply, *, b64):
