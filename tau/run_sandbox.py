@@ -60,7 +60,7 @@ async def protected[T](arg: typing.Awaitable[T]) -> T:
     '''Wait for a future, deferring cancellation until it is complete.
 
     If you do
-        await deferred_shield(something())
+        await protected(something())
 
     it is approximately equivalent to
         await something()
@@ -343,19 +343,32 @@ async def sync_dir(box, src_dir, target_dir):
     Skips .venv*, .env*, .git, .tau.
     """
     src = Path(src_dir)
+    paths = []
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if not _skipped(d)]
+        for name in files:
+            if not _skipped(name):
+                paths.append(Path(root, name).relative_to(src))
+    await sync_paths(box, src, target_dir, paths)
+
+
+async def sync_paths(box, src_dir, target_dir, paths):
+    """Copies the given paths, relative to ``src_dir``, to a sandbox.
+
+    Paths that aren't regular files are skipped.
+    """
+    src = Path(src_dir)
     await box.fs.mkdir(target_dir)
     async with box.fs.batch(cwd=target_dir) as batch:
-        for root, dirs, files in os.walk(src):
-            dirs[:] = [d for d in dirs if not _skipped(d)]
-            for name in files:
-                path = Path(root, name)
-                if _skipped(name) or not path.is_file():
-                    continue
-                batch.write_bytes(
-                    path.relative_to(src).as_posix(),
-                    path.read_bytes(),
-                    mode=stat.S_IMODE(path.stat().st_mode),
-                )
+        for rel in paths:
+            path = src / rel
+            if not path.is_file():
+                continue
+            batch.write_bytes(
+                Path(rel).as_posix(),
+                path.read_bytes(),
+                mode=stat.S_IMODE(path.stat().st_mode),
+            )
 
 
 def _skipped(name):
