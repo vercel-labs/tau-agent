@@ -124,14 +124,41 @@ def with_resolved_key(model: ai.Model) -> ai.Model:
     return model.model_copy(update={"provider": provider})
 
 
+@dataclasses.dataclass
+class _Added:
+    """Messages the remote loop appended to its copy of the context."""
+
+    messages: list[ai.messages.Message]
+
+
+class _SyncingContext(ai.Context):
+    """The worker's copy of the context, reporting each ``add`` at once.
+
+    The ``_Added`` goes on the runtime queue, which is merged into the
+    event stream ahead of the loop's own events, so it reaches the
+    caller while the loop is still waiting on the next model response.
+    """
+
+    def add(
+        self,
+        message: ai.messages.Message | Sequence[ai.messages.Message] | None,
+    ) -> None:
+        before = len(self.messages)
+        super().add(message)
+        if len(self.messages) > before:
+            queue = ai.agents.runtime.get_runtime()._event_queue
+            queue.put_nowait(_Added(self.messages[before:]))  # type: ignore[arg-type]
+
+
 def _remote_loop(
     agent: SandboxAgent, context: ai.Context
-) -> AsyncGenerator[ai.events.AgentEvent]:
+) -> AsyncGenerator[ai.events.AgentEvent | _Added]:
     """Runs in the worker, with the runtime that ``Agent.run`` sets up locally.
 
     Tools put partial results onto the runtime, so they have to be merged
     in here to make it back to the caller.
     """
+    context.__class__ = _SyncingContext
     return ai.agents.runtime.run(ai.Agent.loop(agent, context))
 
 
@@ -161,7 +188,10 @@ class SandboxAgent(ai.Agent):
         else:
             async with worker.iterate(_remote_loop, self, context) as s:
                 async for x in s:
-                    yield x
+                    if isinstance(x, _Added):
+                        context.messages.extend(x.messages)
+                    else:
+                        yield x
 
 
 @contextlib.asynccontextmanager
