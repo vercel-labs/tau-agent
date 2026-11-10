@@ -1088,7 +1088,7 @@ class TauApp(textual.app.App[None]):
         require_approval: bool | None = None,
     ) -> None:
         super().__init__()
-        self.model = ai.get_model(MODEL_ID)
+        self.model = sandbox.with_resolved_key(ai.get_model(MODEL_ID))
         self.agent = sandbox.SandboxAgent(
             sandbox_tools=tools.TOOLS,
             extra_tools=_provider_tools(MODEL_ID),

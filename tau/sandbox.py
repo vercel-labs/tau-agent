@@ -111,6 +111,19 @@ copyreg.pickle(ai.agents.agent.AgentTool, _reduce_agent_tool)
 copyreg.pickle(types.MappingProxyType, lambda m: (_mappingproxy, (dict(m),)))
 
 
+def with_resolved_key(model: ai.Model) -> ai.Model:
+    """Copy ``model`` with its API key read now, so it pickles along.
+
+    Otherwise the provider reads its key env var at call time, which
+    a sandbox worker doesn't have.
+    """
+    key = model.provider.api_key
+    if key is None:
+        return model
+    provider = model.provider.model_copy(update={"api_key_value": key})
+    return model.model_copy(update={"provider": provider})
+
+
 def _remote_loop(
     agent: SandboxAgent, context: ai.Context
 ) -> AsyncGenerator[ai.events.AgentEvent]:
