@@ -22,6 +22,7 @@ import json
 import os
 import pathlib
 import sys
+import traceback
 from typing import Any
 
 import ai
@@ -305,7 +306,9 @@ async def chat_loop(app: TauApp) -> None:
             app.show_system("interrupted")
             raise
         except Exception as exc:  # noqa: BLE001 — surface in the UI
-            app.show_system(f"error: {_flatten_error(exc)}")
+            app.show_system(
+                "error: " + "".join(traceback.format_exception(exc))
+            )
 
 
 MAX_TURN_ATTEMPTS = 3

@@ -38,6 +38,12 @@ uv run poe check    # format check + lint + type-check (matches CI)
 Individual tasks are also available: `uv run poe format-check`,
 `uv run poe lint`, `uv run poe type` (defined in `[tool.poe.tasks]`).
 
+## Debugging
+
+The TUI owns the terminal, so `print` is useless.  Use
+`from tau.debug import dprint` and `tail -f /tmp/tau-debug.log`
+(override with `TAU_DEBUG_LOG`).
+
 ## Smoke test
 
 ```bash
