@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import copyreg
 import dataclasses
 import functools
-import importlib
 import pathlib
-import pickle
-import types
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Sequence,
+)
 from typing import Any
 
 import ai
@@ -36,28 +37,12 @@ _worker: contextvars.ContextVar[run_sandbox.BaseWorker | None] = (
 )
 
 
-def _lookup(module: str, qualname: str) -> Any:
-    obj: Any = importlib.import_module(module)
-    for attr in qualname.split("."):
-        obj = getattr(obj, attr)
-    return obj
-
-
-def _call_tool(module: str, qualname: str, /, **kwargs: Any) -> Any:
-    obj = _lookup(module, qualname)
-    if isinstance(obj, ai.agents.agent.AgentTool):
-        obj = obj.fn
-    return obj(**kwargs)
-
-
-def _dispatch(
-    module: str, qualname: str, streaming: bool, /, **kwargs: Any
-) -> Any:
+def _dispatch(fn: Callable[..., Any], streaming: bool, /, **kwargs: Any) -> Any:
     worker = _worker.get()
     if worker is None:
-        return _call_tool(module, qualname, **kwargs)
+        return fn(**kwargs)
     call = worker.iterate if streaming else worker.run
-    return call(_call_tool, module, qualname, **kwargs)
+    return call(fn, **kwargs)
 
 
 def _wrap_tool(
@@ -66,49 +51,8 @@ def _wrap_tool(
     tool = t.tool
     if require_approval is not None:
         tool = tool.model_copy(update={"require_approval": require_approval})
-    return dataclasses.replace(
-        t,
-        tool=tool,
-        fn=functools.partial(
-            _dispatch,
-            t.fn.__module__,
-            t.fn.__qualname__,
-            t.aggregator is not None,
-        ),
-    )
-
-
-def _unpickle_wrapped_tool(
-    module: str, qualname: str, require_approval: bool
-) -> ai.agents.agent.AgentTool:
-    return _wrap_tool(_lookup(module, qualname), require_approval)
-
-
-def _reduce_agent_tool(t: ai.agents.agent.AgentTool) -> Any:
-    """Pickle tools by reference, since their validators are dynamic classes."""
-    fn = t.fn
-    if isinstance(fn, functools.partial) and fn.func is _dispatch:
-        module, qualname, _ = fn.args
-        args = (module, qualname, t.tool.require_approval)
-        return _unpickle_wrapped_tool, args
-    module, qualname = fn.__module__, fn.__qualname__
-    try:
-        found = _lookup(module, qualname)
-    except (ImportError, AttributeError):
-        found = None
-    if found is not t:
-        raise pickle.PicklingError(
-            f"can't pickle tool {t.name!r}: not found as {module}.{qualname}"
-        )
-    return _lookup, (module, qualname)
-
-
-def _mappingproxy(d: dict[Any, Any]) -> types.MappingProxyType[Any, Any]:
-    return types.MappingProxyType(d)
-
-
-copyreg.pickle(ai.agents.agent.AgentTool, _reduce_agent_tool)
-copyreg.pickle(types.MappingProxyType, lambda m: (_mappingproxy, (dict(m),)))
+    fn = functools.partial(_dispatch, t.fn, t.aggregator is not None)
+    return dataclasses.replace(t, tool=tool, fn=fn)
 
 
 def with_resolved_key(model: ai.Model) -> ai.Model:

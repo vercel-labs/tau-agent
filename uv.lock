@@ -8,8 +8,8 @@ resolution-markers = [
 
 [[package]]
 name = "ai"
-version = "0.8.1.dev14+c0c72ee"
-source = { git = "https://github.com/vercel-labs/ai-python?rev=c0c72eeca22d1399fc8859081fba5d973370899b#c0c72eeca22d1399fc8859081fba5d973370899b" }
+version = "0.9.1.dev3+554e985"
+source = { git = "https://github.com/vercel-labs/ai-python?branch=sandbox-fixes#554e98587f944fc06e2a1ee4711ef1b1002e72bf" }
 dependencies = [
     { name = "httpx2" },
     { name = "modelsdotdev" },
@@ -1021,7 +1021,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ai", extras = ["anthropic", "openai"], git = "https://github.com/vercel-labs/ai-python?rev=c0c72eeca22d1399fc8859081fba5d973370899b" },
+    { name = "ai", extras = ["anthropic", "openai"], git = "https://github.com/vercel-labs/ai-python?branch=sandbox-fixes" },
     { name = "textual", specifier = ">=3.0" },
     { name = "vercel", specifier = ">=0.12.2" },
 ]

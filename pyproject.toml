@@ -20,7 +20,7 @@ build-backend = "hatchling.build"
 packages = ["tau"]
 
 [tool.uv.sources]
-ai = { git = "https://github.com/vercel-labs/ai-python", rev = "c0c72eeca22d1399fc8859081fba5d973370899b" }
+ai = { git = "https://github.com/vercel-labs/ai-python", branch = "sandbox-fixes" }
 
 [tool.ruff]
 line-length = 80

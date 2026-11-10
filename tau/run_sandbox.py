@@ -566,7 +566,7 @@ class SandboxWorker(BaseWorker):
     ``main_path`` is a local path inside ``src_dir``.
     """
 
-    def __init__(self, box, main_path=None, *, src_dir=".", target_dir="workspace"):
+    def __init__(self, box, main_path=None, *, src_dir=".", target_dir="workspace", env=None):
         if main_path is None:
             main_path = sys.modules["__main__"].__file__
         remote_main = os.path.relpath(main_path, src_dir)
@@ -576,6 +576,7 @@ class SandboxWorker(BaseWorker):
         self._box = box
         self._src_dir = src_dir
         self._target_dir = target_dir
+        self._env = env
 
     def _uv_args(self):
         python = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -589,6 +590,7 @@ class SandboxWorker(BaseWorker):
             uv,
             [*args, "--base64"],
             cwd=self._target_dir,
+            env=self._env,
             stdin=subprocess.PIPE,
         )
         try:
