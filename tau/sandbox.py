@@ -10,6 +10,7 @@ in the worker, tools included; in ``"tools"`` mode only the tools do.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import dataclasses
@@ -25,6 +26,7 @@ from typing import Any, Literal
 
 import ai
 import ai.agents.agent
+import ai.agents.hooks
 import ai.agents.runtime
 from vercel import sandbox
 from vercel.api import session
@@ -112,6 +114,78 @@ def _remote_loop(
     return ai.agents.runtime.run(ai.Agent.loop(agent, context))
 
 
+def _resolve_remote(
+    label: str, resolution: dict[str, Any] | BaseException
+) -> None:
+    ai.resolve_hook(label, resolution)
+
+
+async def _cancel_remote(label: str, reason: str | None) -> None:
+    await ai.cancel_hook(label, reason=reason)
+
+
+class _HookBridge:
+    """Stands in locally for the remote loop's pending hooks.
+
+    A stand-in is a live hook in the local run's registry, so the
+    caller resolves or cancels it as usual; the outcome is then passed
+    on to the hook in the worker.
+    """
+
+    def __init__(self, worker: run_sandbox.BaseWorker) -> None:
+        self._worker = worker
+        self._registry = ai.get_hook_registry()
+        self._runtime = ai.agents.runtime.get_runtime()
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._cancelled: set[str] = set()
+
+    def forward(self, event: ai.events.HookEvent) -> bool:
+        """Note a hook event from the worker; return whether to yield it.
+
+        A cancellation the caller made here was already reported here.
+        """
+        hook = event.hook
+        if hook.status == "cancelled":
+            return hook.hook_id not in self._cancelled
+        if hook.status == "pending":
+            future: asyncio.Future[dict[str, Any]] = asyncio.Future()
+            self._registry._live_hooks[hook.hook_id] = (
+                future,
+                hook.metadata,
+                self._runtime,
+            )
+            self._tasks[hook.hook_id] = asyncio.create_task(
+                self._pass_on(hook.hook_id, future)
+            )
+        return True
+
+    async def _pass_on(
+        self, label: str, future: asyncio.Future[dict[str, Any]]
+    ) -> None:
+        try:
+            try:
+                resolution: dict[str, Any] | BaseException = await future
+            except asyncio.CancelledError as exc:
+                if not future.cancelled():
+                    raise
+                self._cancelled.add(label)
+                reason = exc.args[0] if exc.args else None
+                await self._worker.run(_cancel_remote, label, reason)
+                return
+            except Exception as exc:
+                resolution = exc
+            await self._worker.run(_resolve_remote, label, resolution)
+        finally:
+            self._registry._live_hooks.pop(label, None)
+            self._tasks.pop(label, None)
+
+    async def aclose(self) -> None:
+        tasks = list(self._tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class SandboxAgent(ai.Agent):
     """An agent that runs ``sandbox_tools`` in the ambient sandbox worker.
 
@@ -136,12 +210,27 @@ class SandboxAgent(ai.Agent):
             async for x in super().loop(context):
                 yield x
         else:
-            async with worker.iterate(_remote_loop, self, context) as s:
-                async for item in s:
-                    if isinstance(item, _Added):
-                        context.messages.extend(item.messages)
-                    else:
-                        yield item
+            bridge = _HookBridge(worker)
+            try:
+                async with worker.iterate(_remote_loop, self, context) as s:
+                    async for item in s:
+                        if isinstance(item, _Added):
+                            context.messages.extend(item.messages)
+                        elif not isinstance(
+                            item, ai.events.HookEvent
+                        ) or bridge.forward(item):
+                            yield item
+            finally:
+                await bridge.aclose()
+
+
+def _install_hook_registry() -> None:
+    """Give the worker a hook registry, for tools that call hooks.
+
+    Being sync, it runs in the worker's root context, so every later
+    request sees it.
+    """
+    ai.agents.hooks._hook_registry.set(ai.agents.hooks.HookRegistry())
 
 
 @contextlib.asynccontextmanager
@@ -159,6 +248,7 @@ async def sandbox_worker(
             box, run_sandbox.__file__, src_dir=str(_REPO_ROOT)
         ) as worker,
     ):
+        await worker.run(_install_hook_registry)
         token = _worker.set(worker)
         mode_token = _mode.set(mode)
         try:

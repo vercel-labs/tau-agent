@@ -19,7 +19,9 @@ answered. Commands:
   running. Cancelled requests get no reply.
 
 Sync functions run on the event loop's thread, so they run one at a time and
-block other requests while they do.
+block other requests while they do. They also run in the worker's root
+context, so context variables they set are seen by every later request; async
+functions run in a copy of it.
 
 Every other request gets exactly one reply, ``(request_id, reply)`` with
 ``reply`` a pickled ``("ok", value)`` or ``("err", exc)``. Replies arrive as

@@ -1447,9 +1447,15 @@ def _parse_args() -> argparse.Namespace:
         choices=["loop", "tools"],
         default=None,
         help=(
-            "Run in a remote Vercel sandbox, with tools unapproved: the whole"
-            " agent loop (loop, the default) or just the tools (tools)."
+            "Run in a remote Vercel sandbox: the whole agent loop (loop, the"
+            " default) or just the tools (tools)."
         ),
+    )
+    parser.add_argument(
+        "--no-approval",
+        action="store_true",
+        default=False,
+        help="Run all tools without asking for approval.",
     )
     return parser.parse_args()
 
@@ -1488,18 +1494,21 @@ def main() -> None:
             print(f"Session not found: {args.session}", file=sys.stderr)
             sys.exit(1)
 
+    require_approval = False if args.no_approval else None
     if args.sandbox:
-        asyncio.run(_run_sandboxed(resume_path, args.sandbox))
+        asyncio.run(_run_sandboxed(resume_path, args.sandbox, require_approval))
     else:
-        TauApp(resume_path=resume_path).run()
+        TauApp(resume_path=resume_path, require_approval=require_approval).run()
 
 
 async def _run_sandboxed(
-    resume_path: pathlib.Path | None, mode: sandbox.Mode
+    resume_path: pathlib.Path | None,
+    mode: sandbox.Mode,
+    require_approval: bool | None,
 ) -> None:
     print("starting sandbox…", file=sys.stderr)
     async with sandbox.sandbox_worker(mode):
-        app = TauApp(resume_path=resume_path, require_approval=False)
+        app = TauApp(resume_path=resume_path, require_approval=require_approval)
         await app.run_async()
 
 
