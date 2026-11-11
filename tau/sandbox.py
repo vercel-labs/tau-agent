@@ -65,6 +65,7 @@ class Worker(Protocol):
         self,
         func: Callable[[*Ts], Iterable[T] | AsyncIterable[T]],
         *args: *Ts,
+        free_running: bool = False,
     ) -> RemoteIterator[T]: ...
 
 
@@ -82,7 +83,7 @@ def _dispatch(fn: Callable[..., Any], streaming: bool, /, **kwargs: Any) -> Any:
         return fn(**kwargs)
     call = functools.partial(fn, **kwargs)
     if streaming:
-        return worker.iterate(call)
+        return worker.iterate(call, free_running=True)
     return worker.run(call)
 
 
@@ -245,7 +246,9 @@ class SandboxAgent(ai.Agent):
         else:
             bridge = _HookBridge(worker)
             try:
-                async with worker.iterate(_remote_loop, self, context) as s:
+                async with worker.iterate(
+                    _remote_loop, self, context, free_running=True
+                ) as s:
                     async for item in s:
                         if isinstance(item, _Added):
                             context.messages.extend(item.messages)

@@ -15,6 +15,10 @@ answered. Commands:
 * ``("next", id)`` advances iterator ``id``, replying ``("yield", value)`` or,
   once it is exhausted, ``("done", return_value)``.
 * ``("close", id)`` closes iterator ``id`` early.
+* ``("stream", func, args)`` iterates over ``func(*args)`` without waiting to
+  be asked, replying ``("yield", value)`` for each item and then
+  ``("done", return_value)``, all under the one request id. Cancelling the
+  request closes the iterator.
 * ``("cancel", request_id)`` cancels that request's task, if it is still
   running. Cancelled requests get no reply.
 
@@ -23,10 +27,10 @@ block other requests while they do. They also run in the worker's root
 context, so context variables they set are seen by every later request; async
 functions run in a copy of it.
 
-Every other request gets exactly one reply, ``(request_id, reply)`` with
-``reply`` a pickled ``("ok", value)`` or ``("err", exc)``. Replies arrive as
-requests finish, in any order. Each is framed as an 8-byte big-endian length
-followed by the pickle.
+Every other request but ``stream`` gets exactly one reply,
+``(request_id, reply)`` with ``reply`` a pickled ``("ok", value)`` or
+``("err", exc)``. Replies arrive as requests finish, in any order. Each is
+framed as an 8-byte big-endian length followed by the pickle.
 With ``--base64`` each frame is base64-encoded and newline-terminated, which
 survives transports that decode output as text, such as sandbox command logs.
 """
@@ -39,6 +43,7 @@ import base64
 import dataclasses
 import inspect
 import itertools
+import math
 import os
 import pickle
 import runpy
@@ -66,6 +71,10 @@ import anyio
 import anyio.abc
 from anyio.abc import ByteReceiveStream, ByteSendStream, ObjectReceiveStream
 from anyio.streams.buffered import BufferedByteReceiveStream
+from anyio.streams.memory import (
+    MemoryObjectReceiveStream,
+    MemoryObjectSendStream,
+)
 
 _LENGTH = struct.Struct(">Q")
 
@@ -161,6 +170,10 @@ def encode_reply(
         inner = pickle.dumps(reply)
     except Exception as exc:
         inner = pickle.dumps(("err", _pickleable_error(exc)))
+    return _frame(request_id, inner, b64=b64)
+
+
+def _frame(request_id: int, inner: bytes, *, b64: bool) -> bytes:
     data = pickle.dumps((request_id, inner))
     frame = _LENGTH.pack(len(data)) + data
     if b64:
@@ -233,25 +246,34 @@ class _Server:
         self._b64 = b64
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._iterators: dict[int, Iterator[Any] | AsyncIterator[Any]] = {}
+        task = asyncio.current_task()
+        assert task is not None
+        self._root_context = task.get_context()
+
+    def _write(self, data: bytes) -> None:
+        self._out.write(data)
+        self._out.flush()
 
     def _reply(self, request_id: int, status: str, value: Any) -> None:
-        self._out.write(
-            encode_reply(request_id, (status, value), b64=self._b64)
-        )
-        self._out.flush()
+        self._write(encode_reply(request_id, (status, value), b64=self._b64))
 
     def start(self, request_id: int, payload: bytes) -> None:
         try:
-            is_async, value = self._handle(pickle.loads(payload))
+            kind, value = self._handle(pickle.loads(payload))
         except Exception as exc:
             self._reply(request_id, "err", _pickleable_error(exc))
             return
-        if is_async:
-            self._tasks[request_id] = asyncio.create_task(
-                self._finish(request_id, value)
-            )
-        else:
-            self._reply(request_id, "ok", value)
+        match kind:
+            case "value":
+                self._reply(request_id, "ok", value)
+            case "await":
+                self._tasks[request_id] = asyncio.create_task(
+                    self._finish(request_id, value)
+                )
+            case "stream":
+                self._tasks[request_id] = asyncio.create_task(
+                    self._stream(request_id, value)
+                )
 
     async def _finish(self, request_id: int, awaitable: Awaitable[Any]) -> None:
         try:
@@ -265,45 +287,90 @@ class _Server:
         finally:
             self._tasks.pop(request_id, None)
 
+    async def _stream(
+        self, request_id: int, it: Iterator[Any] | AsyncIterator[Any]
+    ) -> None:
+        try:
+            try:
+                value = await self._drain(request_id, it)
+            finally:
+                if isinstance(it, AsyncIterator):
+                    if hasattr(it, "aclose"):
+                        await it.aclose()
+                elif hasattr(it, "close"):
+                    self._root_context.run(it.close)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self._reply(request_id, "err", _pickleable_error(exc))
+        else:
+            self._reply(request_id, "ok", ("done", value))
+        finally:
+            self._tasks.pop(request_id, None)
+
+    async def _drain(
+        self, request_id: int, it: Iterator[Any] | AsyncIterator[Any]
+    ) -> Any:
+        """Send each item of ``it``, and return its return value.
+
+        Sync iterators advance in the root context, as in ``next``.  An
+        item that fails to pickle raises, ending the stream.
+        """
+        while True:
+            if isinstance(it, AsyncIterator):
+                try:
+                    item = await it.__anext__()
+                except StopAsyncIteration:
+                    return None
+            else:
+                try:
+                    item = self._root_context.run(next, it)
+                except StopIteration as stop:
+                    return stop.value
+            inner = pickle.dumps(("ok", ("yield", item)))
+            self._write(_frame(request_id, inner, b64=self._b64))
+            await asyncio.sleep(0)
+
     async def shutdown(self) -> None:
         tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _handle(self, command: tuple[Any, ...]) -> tuple[bool, Any]:
-        """Return ``(False, value)``, or ``(True, awaitable)`` to await."""
+    def _handle(self, command: tuple[Any, ...]) -> tuple[str, Any]:
+        """Return ``("value", value)`` to reply with, ``("await",
+        awaitable)`` to await and reply with, or ``("stream", iterator)``
+        to stream."""
         match command:
             case ("init", path):
                 _load_main(path)
-                return False, None
+                return "value", None
             case ("run", func, args):
                 result = func(*args)
-                return inspect.isawaitable(result), result
+                if inspect.isawaitable(result):
+                    return "await", result
+                return "value", result
             case ("iter", iter_id, func, args):
-                result = func(*args)
-                self._iterators[iter_id] = (
-                    result
-                    if isinstance(result, AsyncIterator)
-                    else iter(result)
-                )
-                return False, None
+                self._iterators[iter_id] = _as_iterator(func(*args))
+                return "value", None
+            case ("stream", func, args):
+                return "stream", _as_iterator(func(*args))
             case ("next", iter_id):
                 it = self._iterators[iter_id]
                 if isinstance(it, AsyncIterator):
-                    return True, self._anext(iter_id, it)
-                return False, self._next(iter_id, it)
+                    return "await", self._anext(iter_id, it)
+                return "value", self._next(iter_id, it)
             case ("close", iter_id):
                 closing: Any = self._iterators.pop(iter_id, None)
                 if hasattr(closing, "aclose"):
-                    return True, closing.aclose()
+                    return "await", closing.aclose()
                 if hasattr(closing, "close"):
                     closing.close()
-                return False, None
+                return "value", None
             case ("cancel", target):
                 if task := self._tasks.get(target):
                     task.cancel()
-                return False, None
+                return "value", None
             case _:
                 raise ValueError(f"unknown command: {command!r}")
 
@@ -328,6 +395,14 @@ class _Server:
         except BaseException:
             self._iterators.pop(iter_id, None)
             raise
+
+
+def _as_iterator(
+    iterable: Iterable[Any] | AsyncIterable[Any],
+) -> Iterator[Any] | AsyncIterator[Any]:
+    if isinstance(iterable, AsyncIterator):
+        return iterable
+    return iter(iterable)  # type: ignore[arg-type]
 
 
 async def _serve(stdin: IO[bytes], out: IO[bytes], b64: bool) -> None:
@@ -406,8 +481,11 @@ class Worker:
         self._iter_ids = itertools.count()
         self._request_ids = itertools.count()
         self._pending: dict[int, _Pending] = {}
+        self._streams: dict[int, MemoryObjectSendStream[bytes | BaseException]]
+        self._streams = {}
         self._closed = False
-        self._abandoned_iterators: list[int] = []
+        # Commands from RemoteIterator.__del__, sent with the next request.
+        self._abandoned: list[tuple[Any, ...]] = []
 
     async def __aenter__(self) -> Self:
         async with AsyncExitStack() as stack:
@@ -459,6 +537,8 @@ class Worker:
                 if pending := self._pending.get(request_id):
                     pending.reply = reply
                     pending.done.set()
+                elif stream := self._streams.get(request_id):
+                    stream.send_nowait(reply)
         except (
             anyio.EndOfStream,
             anyio.IncompleteRead,
@@ -468,21 +548,23 @@ class Worker:
         except Exception as exc:
             error = exc
         self._closed = True
-        if self._pending:
+        if self._pending or self._streams:
             if error is None:
                 error = EOFError(await self._closed_message())
             for pending in self._pending.values():
                 pending.error = error
                 pending.done.set()
+            for stream in self._streams.values():
+                stream.send_nowait(error)
 
     async def _send(self, request_id: int, command: tuple[Any, ...]) -> None:
         data = pickle.dumps((request_id, pickle.dumps(command)))
         async with self._send_lock:
-            # Close iterators abandoned by RemoteIterator.__del__; nothing
-            # waits for these replies, so the reader drops them.
+            # Nothing waits for the replies to abandoned commands, so the
+            # reader drops them.
             closes = []
-            while self._abandoned_iterators:
-                close = ("close", self._abandoned_iterators.pop())
+            while self._abandoned:
+                close = self._abandoned.pop()
                 closes.append(
                     pickle.dumps((next(self._request_ids), pickle.dumps(close)))
                 )
@@ -516,6 +598,40 @@ class Worker:
         assert pending.reply is not None
         return unwrap_reply(pending.reply)
 
+    async def _open_stream(
+        self, command: tuple[Any, ...]
+    ) -> tuple[int, MemoryObjectReceiveStream[bytes | BaseException]]:
+        """Send ``command`` and return its id and a stream of its replies.
+
+        The stream also gets the error if the worker goes away.  Each
+        reply is buffered until it is received, however many there are.
+        """
+        if self._closed:
+            raise EOFError(await self._closed_message())
+        request_id = next(self._request_ids)
+        send, receive = anyio.create_memory_object_stream[
+            bytes | BaseException
+        ](math.inf)
+        self._streams[request_id] = send
+        try:
+            await self._send(request_id, command)
+        except BaseException:
+            await self._close_stream(request_id, cancel=False)
+            receive.close()
+            raise
+        return request_id, receive
+
+    async def _close_stream(self, request_id: int, *, cancel: bool) -> None:
+        """Stop taking replies to ``request_id``, cancelling it if asked."""
+        send = self._streams.pop(request_id, None)
+        if send is None:
+            return
+        send.close()
+        if cancel and not self._closed:
+            await protected(
+                self._send(next(self._request_ids), ("cancel", request_id))
+            )
+
     @overload
     async def run[*Ts, R](
         self, func: Callable[[*Ts], Awaitable[R]], *args: *Ts
@@ -529,13 +645,18 @@ class Worker:
         self,
         func: Callable[[*Ts], Iterable[T] | AsyncIterable[T]],
         *args: *Ts,
+        free_running: bool = False,
     ) -> RemoteIterator[T]:
         """Iterate remotely over ``func(*args)``, an item per trip.
+
+        With ``free_running``, the worker advances the iterator without
+        waiting to be asked and sends each item as it comes, saving a
+        round trip per item; items not yet taken are buffered here.
 
         Use ``async with`` to close the remote iterator if you stop early;
         otherwise it stays open in the worker until the worker exits.
         """
-        return RemoteIterator(self, func, args)
+        return RemoteIterator(self, func, args, free_running=free_running)
 
 
 class RemoteIterator[T]:
@@ -546,10 +667,16 @@ class RemoteIterator[T]:
         worker: Worker,
         func: Callable[..., Iterable[T] | AsyncIterable[T]],
         args: tuple[Any, ...],
+        *,
+        free_running: bool = False,
     ) -> None:
         self._worker = worker
         self._call_args = (func, args)
+        self._free_running = free_running
         self._id = next(worker._iter_ids)
+        self._request_id = -1
+        self._replies: MemoryObjectReceiveStream[bytes | BaseException] | None
+        self._replies = None
         self._started = False
         self._finished = False
 
@@ -560,22 +687,59 @@ class RemoteIterator[T]:
         if self._finished:
             raise StopAsyncIteration
         try:
-            if not self._started:
-                self._started = True
-                await self._worker._call(("iter", self._id, *self._call_args))
-            kind, value = await self._worker._call(("next", self._id))
+            if self._free_running:
+                kind, value = await self._next_streamed()
+            else:
+                kind, value = await self._next_stepped()
         except BaseException:
             self._finished = True
+            await self._end_stream(cancel=True)
             raise
         if kind == "done":
             self._finished = True
             raise StopAsyncIteration
         return value  # type: ignore[no-any-return]
 
+    async def _next_stepped(self) -> tuple[str, Any]:
+        if not self._started:
+            self._started = True
+            await self._worker._call(("iter", self._id, *self._call_args))
+        return await self._worker._call(("next", self._id))  # type: ignore[no-any-return]
+
+    async def _next_streamed(self) -> tuple[str, Any]:
+        if not self._started:
+            self._started = True
+            self._request_id, self._replies = await self._worker._open_stream(
+                ("stream", *self._call_args)
+            )
+        assert self._replies is not None
+        ended = False
+        try:
+            reply = await self._replies.receive()
+            if isinstance(reply, BaseException):
+                ended = True
+                raise reply
+            status, value = pickle.loads(reply)
+            ended = status == "err" or value[0] == "done"
+            if status == "err":
+                raise value
+            return value  # type: ignore[no-any-return]
+        finally:
+            if ended:
+                await self._end_stream(cancel=False)
+
+    async def _end_stream(self, *, cancel: bool) -> None:
+        if self._replies is not None:
+            self._replies.close()
+            await self._worker._close_stream(self._request_id, cancel=cancel)
+
     async def aclose(self) -> None:
         if self._started and not self._finished:
             self._finished = True
-            await protected(self._worker._call(("close", self._id)))
+            if self._free_running:
+                await self._end_stream(cancel=True)
+            else:
+                await protected(self._worker._call(("close", self._id)))
         self._finished = True
 
     async def __aenter__(self) -> Self:
@@ -585,8 +749,15 @@ class RemoteIterator[T]:
         await self.aclose()
 
     def __del__(self) -> None:
-        if self._started and not self._finished:
-            self._worker._abandoned_iterators.append(self._id)
+        if not self._started or self._finished:
+            return
+        if not self._free_running:
+            self._worker._abandoned.append(("close", self._id))
+        elif send := self._worker._streams.pop(self._request_id, None):
+            send.close()
+            self._worker._abandoned.append(("cancel", self._request_id))
+        if self._replies is not None:
+            self._replies.close()
 
 
 @dataclasses.dataclass
