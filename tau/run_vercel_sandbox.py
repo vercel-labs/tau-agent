@@ -2,22 +2,28 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shlex
 import stat
 import subprocess
 import sys
-from collections.abc import Iterable
-from contextlib import AsyncExitStack
+from collections.abc import AsyncIterator, Iterable
+from contextlib import AsyncExitStack, asynccontextmanager
 from os import PathLike
 from pathlib import Path
-from typing import Self
 
+from anyio.abc import ByteReceiveStream, ByteSendStream
 from anyio.streams.buffered import BufferedByteReceiveStream
 from vercel.sandbox import Command, InteractiveSession, Sandbox
 
 from tau import run_sandbox
-from tau.run_sandbox import Base64ByteReceiveStream, BaseWorker, protected
+from tau.run_sandbox import (
+    Base64ByteReceiveStream,
+    Process,
+    Worker,
+    protected,
+)
 
 type StrPath = str | PathLike[str]
 
@@ -62,77 +68,86 @@ def _skipped(name: str) -> bool:
     return name.startswith((".venv", ".env")) or name in (".git", ".tau")
 
 
-class SandboxWorker(BaseWorker):
+def _remote_main(main_path: str | None, src_dir: StrPath) -> str:
+    if main_path is None:
+        main_path = sys.modules["__main__"].__file__
+        assert main_path is not None
+    remote_main = os.path.relpath(main_path, src_dir)
+    if remote_main.startswith(os.pardir):
+        raise ValueError(f"{main_path} is not inside {src_dir}")
+    return Path(remote_main).as_posix()
+
+
+def _uv_args(src_dir: StrPath) -> list[str]:
+    python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    script = Path(os.path.relpath(run_sandbox.__file__, src_dir)).as_posix()
+    return ["uv", "run", "--python", python, script]
+
+
+@dataclasses.dataclass
+class _CommandProcess:
+    stdin: ByteSendStream
+    stdout: ByteReceiveStream
+    cmd: Command
+
+    async def exit_message(self) -> str:
+        returncode = await self.cmd.wait()
+        stderr = await self.cmd.stderr.read() if self.cmd.stderr else ""
+        return f"worker exited with {returncode}\n{stderr}"
+
+
+@asynccontextmanager
+async def sandbox_process(
+    box: Sandbox,
+    *,
+    src_dir: StrPath = ".",
+    target_dir: str = "workspace",
+    env: dict[str, str] | None = None,
+) -> AsyncIterator[Process]:
+    """Start a worker in a sandbox on a copy of ``src_dir``, with uv."""
+    await sync_dir(box, src_dir, target_dir)
+    uv, *args = _uv_args(src_dir)
+    cmd = await box.create_command(
+        uv,
+        [*args, "--base64"],
+        cwd=target_dir,
+        env=env,
+        stdin=subprocess.PIPE,
+    )
+    assert cmd.stdin is not None and cmd.stdout is not None
+    stdout = Base64ByteReceiveStream(cmd.stdout)
+    try:
+        yield _CommandProcess(cmd.stdin, stdout, cmd)
+    except BaseException:
+        await protected(cmd.kill())
+        raise
+    try:
+        await cmd.stdin.aclose()
+        await cmd.wait()
+    except Exception as exc:
+        if not _sandbox_stopped(exc):
+            raise
+    await stdout.aclose()
+    if cmd.stderr is not None:
+        await cmd.stderr.aclose()
+
+
+def sandbox_worker(
+    box: Sandbox,
+    main_path: str | None = None,
+    *,
+    src_dir: StrPath = ".",
+    target_dir: str = "workspace",
+    env: dict[str, str] | None = None,
+) -> Worker:
     """A worker in a sandbox, running a copy of ``src_dir`` with ``uv run``.
 
     ``main_path`` is a local path inside ``src_dir``.
     """
-
-    def __init__(
-        self,
-        box: Sandbox,
-        main_path: str | None = None,
-        *,
-        src_dir: StrPath = ".",
-        target_dir: str = "workspace",
-        env: dict[str, str] | None = None,
-    ) -> None:
-        if main_path is None:
-            main_path = sys.modules["__main__"].__file__
-            assert main_path is not None
-        remote_main = os.path.relpath(main_path, src_dir)
-        if remote_main.startswith(os.pardir):
-            raise ValueError(f"{main_path} is not inside {src_dir}")
-        super().__init__(Path(remote_main).as_posix())
-        self._box = box
-        self._src_dir = src_dir
-        self._target_dir = target_dir
-        self._env = env
-
-    def _uv_args(self) -> list[str]:
-        python = f"{sys.version_info.major}.{sys.version_info.minor}"
-        script = Path(
-            os.path.relpath(run_sandbox.__file__, self._src_dir)
-        ).as_posix()
-        return ["uv", "run", "--python", python, script]
-
-    async def __aenter__(self) -> Self:
-        await sync_dir(self._box, self._src_dir, self._target_dir)
-        uv, *args = self._uv_args()
-        self._cmd: Command = await self._box.create_command(
-            uv,
-            [*args, "--base64"],
-            cwd=self._target_dir,
-            env=self._env,
-            stdin=subprocess.PIPE,
-        )
-        assert self._cmd.stdin is not None and self._cmd.stdout is not None
-        try:
-            await self._start(
-                self._cmd.stdin, Base64ByteReceiveStream(self._cmd.stdout)
-            )
-        except BaseException:
-            await protected(self._cmd.kill())
-            raise
-        return self
-
-    async def __aexit__(self, *exc_info: object) -> None:
-        await self._stop()
-        try:
-            assert self._cmd.stdin is not None
-            await self._cmd.stdin.aclose()
-            await self._cmd.wait()
-        except Exception as exc:
-            if not _sandbox_stopped(exc):
-                raise
-        await self._stdout.aclose()
-        if self._cmd.stderr is not None:
-            await self._cmd.stderr.aclose()
-
-    async def _closed_message(self) -> str:
-        returncode = await self._cmd.wait()
-        stderr = await self._cmd.stderr.read() if self._cmd.stderr else ""
-        return f"worker exited with {returncode}\n{stderr}"
+    process = sandbox_process(
+        box, src_dir=src_dir, target_dir=target_dir, env=env
+    )
+    return Worker(process, _remote_main(main_path, src_dir))
 
 
 def _sandbox_stopped(exc: BaseException | None) -> bool:
@@ -144,42 +159,59 @@ def _sandbox_stopped(exc: BaseException | None) -> bool:
     return False
 
 
-class PtySandboxWorker(SandboxWorker):
-    """A sandbox worker attached to a PTY in raw mode, so replies are raw bytes.
+_READY = b"RUN_SYNC_READY\n"
+
+
+@dataclasses.dataclass
+class _PtyProcess:
+    stdin: ByteSendStream
+    stdout: ByteReceiveStream
+    pty: InteractiveSession
+    box: Sandbox
+    stderr_path: str
+
+    async def exit_message(self) -> str:
+        returncode = await self.pty.wait()
+        stderr = await self.box.fs.read_text(self.stderr_path)
+        return f"worker exited with {returncode}\n{stderr}"
+
+
+@asynccontextmanager
+async def pty_sandbox_process(
+    box: Sandbox, *, src_dir: StrPath = ".", target_dir: str = "workspace"
+) -> AsyncIterator[Process]:
+    """Like ``sandbox_process``, but on a PTY in raw mode, so replies are raw.
 
     The worker's stderr goes to a file in the sandbox instead of the terminal.
     """
-
-    _READY = b"RUN_SYNC_READY\n"
-
-    async def __aenter__(self) -> Self:
-        await sync_dir(self._box, self._src_dir, self._target_dir)
-        self._stderr_path = f"/tmp/run_sync-{os.urandom(4).hex()}.err"
-        script = (
-            f"cd {shlex.quote(self._target_dir)} && stty raw -echo"
-            f" && printf {shlex.quote(self._READY.decode())}"
-            f" && exec {shlex.join(self._uv_args())} 2>{self._stderr_path}"
+    await sync_dir(box, src_dir, target_dir)
+    stderr_path = f"/tmp/run_sync-{os.urandom(4).hex()}.err"
+    script = (
+        f"cd {shlex.quote(target_dir)} && stty raw -echo"
+        f" && printf {shlex.quote(_READY.decode())}"
+        f" && exec {shlex.join(_uv_args(src_dir))} 2>{stderr_path}"
+    )
+    stack = AsyncExitStack()
+    try:
+        pty = await stack.enter_async_context(
+            box.open_interactive("sh", ["-c", script])
         )
-        self._stack = AsyncExitStack()
-        try:
-            self._pty: InteractiveSession = (
-                await self._stack.enter_async_context(
-                    self._box.open_interactive("sh", ["-c", script])
-                )
-            )
-            stdout = BufferedByteReceiveStream(self._pty.stream)
-            await stdout.receive_until(self._READY, 65536)
-            await self._start(self._pty.stream, stdout)
-        except BaseException:
-            await protected(self._stack.aclose())
-            raise
-        return self
+        stdout = BufferedByteReceiveStream(pty.stream)
+        await stdout.receive_until(_READY, 65536)
+        yield _PtyProcess(pty.stream, stdout, pty, box, stderr_path)
+    except BaseException:
+        await protected(stack.aclose())
+        raise
+    await stack.aclose()
 
-    async def __aexit__(self, *exc_info: object) -> None:
-        await self._stop()
-        await self._stack.aclose()
 
-    async def _closed_message(self) -> str:
-        returncode = await self._pty.wait()
-        stderr = await self._box.fs.read_text(self._stderr_path)
-        return f"worker exited with {returncode}\n{stderr}"
+def pty_sandbox_worker(
+    box: Sandbox,
+    main_path: str | None = None,
+    *,
+    src_dir: StrPath = ".",
+    target_dir: str = "workspace",
+) -> Worker:
+    """Like ``sandbox_worker``, but with ``pty_sandbox_process``."""
+    process = pty_sandbox_process(box, src_dir=src_dir, target_dir=target_dir)
+    return Worker(process, _remote_main(main_path, src_dir))

@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import dataclasses
 import inspect
 import itertools
 import os
@@ -45,7 +46,6 @@ import struct
 import sys
 import threading
 import types
-from abc import ABC, abstractmethod
 from collections.abc import (
     AsyncIterable,
     AsyncIterator,
@@ -54,10 +54,16 @@ from collections.abc import (
     Iterable,
     Iterator,
 )
-from contextlib import suppress
-from typing import IO, Any, Self, overload
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    suppress,
+)
+from typing import IO, Any, Protocol, Self, overload
 
 import anyio
+import anyio.abc
 from anyio.abc import ByteReceiveStream, ByteSendStream, ObjectReceiveStream
 from anyio.streams.buffered import BufferedByteReceiveStream
 
@@ -362,16 +368,40 @@ class _Pending:
         self.error: BaseException | None = None
 
 
-class BaseWorker(ABC):
+class Process(Protocol):
+    """A running worker process: its stdin, its stdout, and how it ended.
+
+    ``Worker`` takes an async context manager that starts one and, on
+    exit, stops it.
+    """
+
+    @property
+    def stdin(self) -> ByteSendStream: ...
+
+    @property
+    def stdout(self) -> ByteReceiveStream: ...
+
+    async def exit_message(self) -> str:
+        """Describe how the process ended, once its output has closed."""
+        ...
+
+
+class Worker:
     """A connection to a worker, used as an async context manager.
 
+    ``process`` starts the worker process on entry and stops it on exit.
     Calls can be made concurrently from several tasks; each waits only for its
     own reply.
     """
 
-    def __init__(self, main_path: str | None = None) -> None:
+    def __init__(
+        self,
+        process: AbstractAsyncContextManager[Process],
+        main_path: str | None = None,
+    ) -> None:
         if main_path is None:
             main_path = getattr(sys.modules["__main__"], "__file__", None)
+        self._process_cm = process
         self._main_path = main_path
         self._iter_ids = itertools.count()
         self._request_ids = itertools.count()
@@ -379,16 +409,21 @@ class BaseWorker(ABC):
         self._closed = False
         self._abandoned_iterators: list[int] = []
 
-    async def _start(
-        self, stdin: ByteSendStream, stdout: ByteReceiveStream
-    ) -> None:
-        """Start reading replies from ``stdout``, then send ``init``.
+    async def __aenter__(self) -> Self:
+        async with AsyncExitStack() as stack:
+            self._process = await stack.enter_async_context(self._process_cm)
+            await self._start()
+            self._exit_stack = stack.pop_all()
+        return self
 
-        Subclasses call this from ``__aenter__`` and ``_stop`` from
-        ``__aexit__``, in the same task.
-        """
-        self._stdin = stdin
-        self._stdout = BufferedByteReceiveStream(stdout)
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self._stop()
+        await self._exit_stack.aclose()
+
+    async def _start(self) -> None:
+        """Start reading replies, then send ``init``."""
+        self._stdin = self._process.stdin
+        self._stdout = BufferedByteReceiveStream(self._process.stdout)
         self._send_lock = anyio.Lock()
         self._reader_scope = anyio.CancelScope()
         self._task_group = anyio.create_task_group()
@@ -405,14 +440,8 @@ class BaseWorker(ABC):
         self._reader_scope.cancel()
         await self._task_group.__aexit__(None, None, None)
 
-    @abstractmethod
-    async def __aenter__(self) -> Self: ...
-
-    @abstractmethod
-    async def __aexit__(self, *exc_info: object) -> None: ...
-
     async def _closed_message(self) -> str:
-        return "worker closed its output"
+        return await self._process.exit_message()
 
     async def _read_replies(self) -> None:
         with self._reader_scope:
@@ -519,7 +548,7 @@ class RemoteIterator[T]:
 
     def __init__(
         self,
-        worker: BaseWorker,
+        worker: Worker,
         func: Callable[..., Iterable[T] | AsyncIterable[T]],
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
@@ -566,35 +595,33 @@ class RemoteIterator[T]:
             self._worker._abandoned_iterators.append(self._id)
 
 
-class LocalWorker(BaseWorker):
+@dataclasses.dataclass
+class _LocalProcess:
+    stdin: ByteSendStream
+    stdout: ByteReceiveStream
+    proc: anyio.abc.Process
+
+    async def exit_message(self) -> str:
+        return f"worker exited with {await self.proc.wait()}"
+
+
+@asynccontextmanager
+async def local_process(
+    python: str = sys.executable,
+) -> AsyncIterator[Process]:
+    """Start a worker subprocess on this machine."""
+    async with await anyio.open_process(
+        [python, __file__], stderr=None
+    ) as proc:
+        assert proc.stdin is not None and proc.stdout is not None
+        yield _LocalProcess(proc.stdin, proc.stdout, proc)
+
+
+def local_worker(
+    main_path: str | None = None, *, python: str = sys.executable
+) -> Worker:
     """A worker subprocess on this machine."""
-
-    def __init__(
-        self, main_path: str | None = None, *, python: str = sys.executable
-    ) -> None:
-        super().__init__(main_path)
-        self._python = python
-
-    async def __aenter__(self) -> Self:
-        self._proc = await anyio.open_process(
-            [self._python, __file__], stderr=None
-        )
-        try:
-            assert (
-                self._proc.stdin is not None and self._proc.stdout is not None
-            )
-            await self._start(self._proc.stdin, self._proc.stdout)
-        except BaseException:
-            await self._proc.aclose()
-            raise
-        return self
-
-    async def __aexit__(self, *exc_info: object) -> None:
-        await self._stop()
-        await self._proc.aclose()
-
-    async def _closed_message(self) -> str:
-        return f"worker exited with {await self._proc.wait()}"
+    return Worker(local_process(python), main_path)
 
 
 if __name__ == "__main__":

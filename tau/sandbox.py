@@ -37,7 +37,7 @@ _REPO_ROOT = pathlib.Path(run_sandbox.__file__).parent.parent
 
 type Mode = Literal["tools", "loop"]
 
-_worker: contextvars.ContextVar[run_sandbox.BaseWorker | None] = (
+_worker: contextvars.ContextVar[run_sandbox.Worker | None] = (
     contextvars.ContextVar("tau_sandbox_worker", default=None)
 )
 _mode: contextvars.ContextVar[Mode] = contextvars.ContextVar(
@@ -132,7 +132,7 @@ class _HookBridge:
     on to the hook in the worker.
     """
 
-    def __init__(self, worker: run_sandbox.BaseWorker) -> None:
+    def __init__(self, worker: run_sandbox.Worker) -> None:
         self._worker = worker
         self._registry = ai.get_hook_registry()
         self._runtime = ai.agents.runtime.get_runtime()
@@ -236,7 +236,7 @@ def _install_hook_registry() -> None:
 @contextlib.asynccontextmanager
 async def sandbox_worker(
     mode: Mode = "loop",
-) -> AsyncIterator[run_vercel_sandbox.SandboxWorker]:
+) -> AsyncIterator[run_sandbox.Worker]:
     """Create a sandbox running a worker on a copy of the repo.
 
     The worker is the ambient sandbox worker, in ``mode``, until exit.
@@ -244,7 +244,7 @@ async def sandbox_worker(
     async with (
         session(),
         sandbox.create_sandbox() as box,
-        run_vercel_sandbox.SandboxWorker(
+        run_vercel_sandbox.sandbox_worker(
             box, run_sandbox.__file__, src_dir=str(_REPO_ROOT)
         ) as worker,
     ):
