@@ -64,6 +64,37 @@ async def sync_paths(
             )
 
 
+async def sync_project(box: Sandbox, src_dir: StrPath, target_dir: str) -> None:
+    """Copies a project to a sandbox: what git lists, else as ``sync_dir``.
+
+    Git lists tracked files and untracked ones it doesn't ignore; of
+    those, what ``sync_dir`` would skip is still skipped.
+    """
+    try:
+        listed = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+            cwd=src_dir,
+            capture_output=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        await sync_dir(box, src_dir, target_dir)
+        return
+    paths = [
+        p
+        for p in os.fsdecode(listed).split("\0")
+        if p and not any(_skipped(part) for part in Path(p).parts)
+    ]
+    await sync_paths(box, src_dir, target_dir, paths)
+
+
 def _skipped(name: str) -> bool:
     return name.startswith((".venv", ".env")) or name in (".git", ".tau")
 

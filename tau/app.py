@@ -1510,7 +1510,8 @@ async def _run_sandboxed(
 ) -> None:
     """Run tau with the ambient worker in a Vercel sandbox.
 
-    The sandbox gets a copy of the repo, and the worker runs there.
+    The sandbox gets a copy of tau, which the worker runs, and a copy of
+    the current directory, which the worker runs in.
     """
     print("starting sandbox…", file=sys.stderr)
     repo_root = pathlib.Path(run_sandbox.__file__).parent.parent
@@ -1520,10 +1521,15 @@ async def _run_sandboxed(
         run_vercel_sandbox.sandbox_worker(
             box, run_sandbox.__file__, src_dir=str(repo_root)
         ) as worker,
-        sandbox.use_worker(worker, mode),
     ):
-        app = TauApp(resume_path=resume_path, require_approval=require_approval)
-        await app.run_async()
+        await run_vercel_sandbox.sync_project(box, os.getcwd(), "project")
+        home = pathlib.PurePosixPath(await worker.run(os.getcwd)).parent
+        await worker.run(os.chdir, str(home / "project"))
+        async with sandbox.use_worker(worker, mode):
+            app = TauApp(
+                resume_path=resume_path, require_approval=require_approval
+            )
+            await app.run_async()
 
 
 if __name__ == "__main__":
