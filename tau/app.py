@@ -40,8 +40,10 @@ import textual.events
 import textual.message
 import textual.widgets
 import textual.worker
+from vercel import sandbox as vercel_sandbox
+from vercel.api import session as vercel_session
 
-from tau import sandbox, session, tools
+from tau import run_sandbox, run_vercel_sandbox, sandbox, session, tools
 
 _raw_model = os.environ.get("TAU_MODEL", "gateway:anthropic/claude-opus-5.5")
 MODEL_ID = _raw_model if ":" in _raw_model else f"gateway:{_raw_model}"
@@ -1506,8 +1508,20 @@ async def _run_sandboxed(
     mode: sandbox.Mode,
     require_approval: bool | None,
 ) -> None:
+    """Run tau with the ambient worker in a Vercel sandbox.
+
+    The sandbox gets a copy of the repo, and the worker runs there.
+    """
     print("starting sandbox…", file=sys.stderr)
-    async with sandbox.sandbox_worker(mode):
+    repo_root = pathlib.Path(run_sandbox.__file__).parent.parent
+    async with (
+        vercel_session(),
+        vercel_sandbox.create_sandbox() as box,
+        run_vercel_sandbox.sandbox_worker(
+            box, run_sandbox.__file__, src_dir=str(repo_root)
+        ) as worker,
+        sandbox.use_worker(worker, mode),
+    ):
         app = TauApp(resume_path=resume_path, require_approval=require_approval)
         await app.run_async()
 

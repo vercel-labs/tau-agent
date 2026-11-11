@@ -1,8 +1,7 @@
 """Run tau's tools in a remote Vercel sandbox.
 
-``sandbox_worker()`` copies the repo into a sandbox, starts a
-``run_sandbox`` worker there, and makes it the ambient worker.
-``SandboxAgent``'s tools run in the ambient worker when there is one,
+``SandboxAgent``'s tools run in the ambient worker, any ``Worker`` made
+ambient with ``use_worker()``, when there is one,
 so they see the sandbox's filesystem and run its shell commands, and
 run locally otherwise.  In ``"loop"`` mode the whole agent loop runs
 in the worker, tools included; in ``"tools"`` mode only the tools do.
@@ -15,30 +14,66 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-import pathlib
 from collections.abc import (
     AsyncGenerator,
+    AsyncIterable,
     AsyncIterator,
+    Awaitable,
     Callable,
+    Iterable,
     Sequence,
 )
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, overload
 
 import ai
 import ai.agents.agent
 import ai.agents.hooks
 import ai.agents.runtime
-from vercel import sandbox
-from vercel.api import session
-
-from tau import run_sandbox, run_vercel_sandbox
-
-_REPO_ROOT = pathlib.Path(run_sandbox.__file__).parent.parent
 
 type Mode = Literal["tools", "loop"]
 
-_worker: contextvars.ContextVar[run_sandbox.Worker | None] = (
-    contextvars.ContextVar("tau_sandbox_worker", default=None)
+
+class RemoteIterator[T](Protocol):
+    """An async iterator over a remote iterable; ``async with`` closes it."""
+
+    def __aiter__(self) -> AsyncIterator[T]: ...
+
+    def __anext__(self) -> Awaitable[T]: ...
+
+    async def __aenter__(self) -> AsyncIterator[T]: ...
+
+    async def __aexit__(self, *exc_info: object) -> None: ...
+
+
+class Worker(Protocol):
+    """Runs functions somewhere else, such as in a sandbox.
+
+    Arguments, results and the functions themselves are pickled.  A
+    sync function's context variable changes are seen by later calls.
+    """
+
+    @overload
+    async def run[**P, R](
+        self,
+        func: Callable[P, Awaitable[R]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R: ...
+    @overload
+    async def run[**P, R](
+        self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
+    ) -> R: ...
+
+    def iterate[**P, T](
+        self,
+        func: Callable[P, Iterable[T] | AsyncIterable[T]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> RemoteIterator[T]: ...
+
+
+_worker: contextvars.ContextVar[Worker | None] = contextvars.ContextVar(
+    "tau_sandbox_worker", default=None
 )
 _mode: contextvars.ContextVar[Mode] = contextvars.ContextVar(
     "tau_sandbox_mode", default="loop"
@@ -49,8 +84,9 @@ def _dispatch(fn: Callable[..., Any], streaming: bool, /, **kwargs: Any) -> Any:
     worker = _worker.get()
     if worker is None:
         return fn(**kwargs)
-    call = worker.iterate if streaming else worker.run
-    return call(fn, **kwargs)
+    if streaming:
+        return worker.iterate(fn, **kwargs)
+    return worker.run(fn, **kwargs)
 
 
 def _wrap_tool(
@@ -132,7 +168,7 @@ class _HookBridge:
     on to the hook in the worker.
     """
 
-    def __init__(self, worker: run_sandbox.Worker) -> None:
+    def __init__(self, worker: Worker) -> None:
         self._worker = worker
         self._registry = ai.get_hook_registry()
         self._runtime = ai.agents.runtime.get_runtime()
@@ -234,25 +270,15 @@ def _install_hook_registry() -> None:
 
 
 @contextlib.asynccontextmanager
-async def sandbox_worker(
-    mode: Mode = "loop",
-) -> AsyncIterator[run_sandbox.Worker]:
-    """Create a sandbox running a worker on a copy of the repo.
-
-    The worker is the ambient sandbox worker, in ``mode``, until exit.
-    """
-    async with (
-        session(),
-        sandbox.create_sandbox() as box,
-        run_vercel_sandbox.sandbox_worker(
-            box, run_sandbox.__file__, src_dir=str(_REPO_ROOT)
-        ) as worker,
-    ):
-        await worker.run(_install_hook_registry)
-        token = _worker.set(worker)
-        mode_token = _mode.set(mode)
-        try:
-            yield worker
-        finally:
-            _mode.reset(mode_token)
-            _worker.reset(token)
+async def use_worker(
+    worker: Worker, mode: Mode = "loop"
+) -> AsyncIterator[None]:
+    """Make ``worker`` the ambient worker, in ``mode``, until exit."""
+    await worker.run(_install_hook_registry)
+    token = _worker.set(worker)
+    mode_token = _mode.set(mode)
+    try:
+        yield
+    finally:
+        _mode.reset(mode_token)
+        _worker.reset(token)
