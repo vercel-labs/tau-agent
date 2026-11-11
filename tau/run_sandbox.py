@@ -29,6 +29,8 @@ With ``--base64`` each frame is base64-encoded and newline-terminated, which
 survives transports that decode output as text, such as sandbox command logs.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import base64
@@ -44,20 +46,34 @@ import subprocess
 import sys
 import threading
 import types
-import typing
 from abc import ABC, abstractmethod
-from contextlib import AsyncExitStack
+from collections.abc import (
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+)
+from contextlib import AsyncExitStack, suppress
+from os import PathLike
 from pathlib import Path
+from typing import IO, TYPE_CHECKING, Any, Self, overload
 
 import anyio
-from anyio.abc import ByteReceiveStream
+from anyio.abc import ByteReceiveStream, ByteSendStream, ObjectReceiveStream
 from anyio.streams.buffered import BufferedByteReceiveStream
+
+if TYPE_CHECKING:
+    from vercel.sandbox import Command, InteractiveSession, Sandbox
+
+type StrPath = str | PathLike[str]
 
 _LENGTH = struct.Struct(">Q")
 
 
-async def protected[T](arg: typing.Awaitable[T]) -> T:
-    '''Wait for a future, deferring cancellation until it is complete.
+async def protected[T](arg: Awaitable[T]) -> T:
+    """Wait for a future, deferring cancellation until it is complete.
 
     If you do
         await protected(something())
@@ -79,12 +95,10 @@ async def protected[T](arg: typing.Awaitable[T]) -> T:
     This is useful for shielding cleanup code from cancellation,
     especially code in finally blocks.
 
-    '''
+    """
     loop = None
-    try:
+    with suppress(RuntimeError):
         loop = asyncio.get_running_loop()
-    except RuntimeError:
-        pass
 
     if not loop:
         with anyio.CancelScope(shield=True):
@@ -92,10 +106,10 @@ async def protected[T](arg: typing.Awaitable[T]) -> T:
 
     done = False
     result: T | None = None
-    exc = None
+    exc: BaseException | None = None
     waiter: asyncio.Future[None] | None = None
 
-    async def go():
+    async def go() -> None:
         nonlocal done, result, exc
         try:
             result = await arg
@@ -107,17 +121,18 @@ async def protected[T](arg: typing.Awaitable[T]) -> T:
             if waiter and not waiter.done():
                 waiter.set_result(None)
 
-    task = asyncio.Task(go(), loop=loop, eager_start=True)
+    # The event loop only holds tasks weakly.
+    _task = asyncio.Task(go(), loop=loop, eager_start=True)
 
-    cancelled = None
-    scope = None
+    cancelled: asyncio.CancelledError | None = None
+    scope: anyio.CancelScope | None = None
     try:
         while not done:
             try:
                 waiter = asyncio.Future()
                 await waiter
             except asyncio.CancelledError as cex:
-                if not scope and (anyio := sys.modules.get("anyio")):
+                if not scope:
                     scope = anyio.CancelScope(shield=True)
                     scope.__enter__()
 
@@ -141,7 +156,9 @@ async def protected[T](arg: typing.Awaitable[T]) -> T:
     return result  # type: ignore[return-value]
 
 
-def encode_reply(request_id, reply, *, b64):
+def encode_reply(
+    request_id: int, reply: tuple[str, Any], *, b64: bool
+) -> bytes:
     try:
         inner = pickle.dumps(reply)
     except Exception as exc:
@@ -156,13 +173,13 @@ def encode_reply(request_id, reply, *, b64):
 class Base64ByteReceiveStream(ByteReceiveStream):
     """Decode newline-terminated base64 lines from a stream of text."""
 
-    def __init__(self, stream):
+    def __init__(self, stream: ObjectReceiveStream[str]) -> None:
         self._stream = stream
         self._text = ""
         self._data = b""
         self._eof = False
 
-    async def receive(self, max_bytes=65536):
+    async def receive(self, max_bytes: int = 65536) -> bytes:
         while not self._data:
             line, newline, rest = self._text.partition("\n")
             if newline:
@@ -181,18 +198,18 @@ class Base64ByteReceiveStream(ByteReceiveStream):
         data, self._data = self._data[:max_bytes], self._data[max_bytes:]
         return data
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         await self._stream.aclose()
 
 
-def unwrap_reply(data):
+def unwrap_reply(data: bytes) -> Any:
     status, value = pickle.loads(data)
     if status == "err":
         raise value
     return value
 
 
-def _load_main(path):
+def _load_main(path: str) -> None:
     path = os.path.abspath(path)
     sys.path.insert(0, os.path.dirname(path))
     # Same approach as multiprocessing's spawn start method: run the script
@@ -202,7 +219,7 @@ def _load_main(path):
     main.__dict__.update(runpy.run_path(path, run_name="__mp_main__"))
 
 
-def _pickleable_error(exc):
+def _pickleable_error(exc: BaseException) -> BaseException:
     try:
         pickle.dumps(exc)
         return exc
@@ -213,28 +230,32 @@ def _pickleable_error(exc):
 class _Server:
     """Handles requests on the worker's event loop."""
 
-    def __init__(self, out, b64):
+    def __init__(self, out: IO[bytes], b64: bool) -> None:
         self._out = out
         self._b64 = b64
-        self._tasks = {}
-        self._iterators = {}
+        self._tasks: dict[int, asyncio.Task[None]] = {}
+        self._iterators: dict[int, Iterator[Any] | AsyncIterator[Any]] = {}
 
-    def _reply(self, request_id, status, value):
-        self._out.write(encode_reply(request_id, (status, value), b64=self._b64))
+    def _reply(self, request_id: int, status: str, value: Any) -> None:
+        self._out.write(
+            encode_reply(request_id, (status, value), b64=self._b64)
+        )
         self._out.flush()
 
-    def start(self, request_id, payload):
+    def start(self, request_id: int, payload: bytes) -> None:
         try:
             is_async, value = self._handle(pickle.loads(payload))
         except Exception as exc:
             self._reply(request_id, "err", _pickleable_error(exc))
             return
         if is_async:
-            self._tasks[request_id] = asyncio.create_task(self._finish(request_id, value))
+            self._tasks[request_id] = asyncio.create_task(
+                self._finish(request_id, value)
+            )
         else:
             self._reply(request_id, "ok", value)
 
-    async def _finish(self, request_id, awaitable):
+    async def _finish(self, request_id: int, awaitable: Awaitable[Any]) -> None:
         try:
             value = await awaitable
         except asyncio.CancelledError:
@@ -246,14 +267,14 @@ class _Server:
         finally:
             self._tasks.pop(request_id, None)
 
-    async def shutdown(self):
+    async def shutdown(self) -> None:
         tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _handle(self, command):
-        """Return ``(False, value)``, or ``(True, awaitable)`` to finish in a task."""
+    def _handle(self, command: tuple[Any, ...]) -> tuple[bool, Any]:
+        """Return ``(False, value)``, or ``(True, awaitable)`` to await."""
         match command:
             case ("init", path):
                 _load_main(path)
@@ -264,20 +285,22 @@ class _Server:
             case ("iter", iter_id, func, args, kwargs):
                 result = func(*args, **kwargs)
                 self._iterators[iter_id] = (
-                    result if hasattr(result, "__anext__") else iter(result)
+                    result
+                    if isinstance(result, AsyncIterator)
+                    else iter(result)
                 )
                 return False, None
             case ("next", iter_id):
                 it = self._iterators[iter_id]
-                if hasattr(it, "__anext__"):
+                if isinstance(it, AsyncIterator):
                     return True, self._anext(iter_id, it)
                 return False, self._next(iter_id, it)
             case ("close", iter_id):
-                it = self._iterators.pop(iter_id, None)
-                if hasattr(it, "aclose"):
-                    return True, it.aclose()
-                if hasattr(it, "close"):
-                    it.close()
+                closing: Any = self._iterators.pop(iter_id, None)
+                if hasattr(closing, "aclose"):
+                    return True, closing.aclose()
+                if hasattr(closing, "close"):
+                    closing.close()
                 return False, None
             case ("cancel", target):
                 if task := self._tasks.get(target):
@@ -286,7 +309,7 @@ class _Server:
             case _:
                 raise ValueError(f"unknown command: {command!r}")
 
-    def _next(self, iter_id, it):
+    def _next(self, iter_id: int, it: Iterator[Any]) -> tuple[str, Any]:
         try:
             return "yield", next(it)
         except StopIteration as stop:
@@ -296,7 +319,9 @@ class _Server:
             del self._iterators[iter_id]
             raise
 
-    async def _anext(self, iter_id, it):
+    async def _anext(
+        self, iter_id: int, it: AsyncIterator[Any]
+    ) -> tuple[str, Any]:
         try:
             return "yield", await it.__anext__()
         except StopAsyncIteration:
@@ -307,11 +332,11 @@ class _Server:
             raise
 
 
-async def _serve(stdin, out, b64):
+async def _serve(stdin: IO[bytes], out: IO[bytes], b64: bool) -> None:
     loop = asyncio.get_running_loop()
-    requests = asyncio.Queue()
+    requests: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue()
 
-    def read_requests():
+    def read_requests() -> None:
         while True:
             try:
                 request = pickle.load(stdin)
@@ -328,16 +353,17 @@ async def _serve(stdin, out, b64):
     await server.shutdown()
 
 
-def worker(*, b64):
+def worker(*, b64: bool) -> None:
     stdin = sys.stdin.buffer
     out = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
-    # Anything the called functions print goes to stderr, keeping stdout for replies.
+    # Anything the called functions print goes to stderr, keeping stdout
+    # for replies.
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-    sys.stdout.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
     asyncio.run(_serve(stdin, out, b64))
 
 
-async def sync_dir(box, src_dir, target_dir):
+async def sync_dir(box: Sandbox, src_dir: StrPath, target_dir: str) -> None:
     """Copies a local directory to a sandbox.
 
     Skips .venv*, .env*, .git, .tau.
@@ -352,7 +378,9 @@ async def sync_dir(box, src_dir, target_dir):
     await sync_paths(box, src, target_dir, paths)
 
 
-async def sync_paths(box, src_dir, target_dir, paths):
+async def sync_paths(
+    box: Sandbox, src_dir: StrPath, target_dir: str, paths: Iterable[StrPath]
+) -> None:
     """Copies the given paths, relative to ``src_dir``, to a sandbox.
 
     Paths that aren't regular files are skipped.
@@ -371,15 +399,15 @@ async def sync_paths(box, src_dir, target_dir, paths):
             )
 
 
-def _skipped(name):
+def _skipped(name: str) -> bool:
     return name.startswith((".venv", ".env")) or name in (".git", ".tau")
 
 
 class _Pending:
-    def __init__(self):
+    def __init__(self) -> None:
         self.done = anyio.Event()
-        self.reply = None
-        self.error = None
+        self.reply: bytes | None = None
+        self.error: BaseException | None = None
 
 
 class BaseWorker(ABC):
@@ -389,17 +417,19 @@ class BaseWorker(ABC):
     own reply.
     """
 
-    def __init__(self, main_path=None):
+    def __init__(self, main_path: str | None = None) -> None:
         if main_path is None:
             main_path = getattr(sys.modules["__main__"], "__file__", None)
         self._main_path = main_path
         self._iter_ids = itertools.count()
         self._request_ids = itertools.count()
-        self._pending = {}
+        self._pending: dict[int, _Pending] = {}
         self._closed = False
-        self._abandoned_iterators = []
+        self._abandoned_iterators: list[int] = []
 
-    async def _start(self, stdin, stdout):
+    async def _start(
+        self, stdin: ByteSendStream, stdout: ByteReceiveStream
+    ) -> None:
         """Start reading replies from ``stdout``, then send ``init``.
 
         Subclasses call this from ``__aenter__`` and ``_stop`` from
@@ -419,33 +449,41 @@ class BaseWorker(ABC):
             await self._stop()
             raise
 
-    async def _stop(self):
+    async def _stop(self) -> None:
         self._reader_scope.cancel()
         await self._task_group.__aexit__(None, None, None)
 
     @abstractmethod
-    async def __aenter__(self): ...
+    async def __aenter__(self) -> Self: ...
 
     @abstractmethod
-    async def __aexit__(self, *exc_info): ...
+    async def __aexit__(self, *exc_info: object) -> None: ...
 
-    async def _closed_message(self):
+    async def _closed_message(self) -> str:
         return "worker closed its output"
 
-    async def _read_replies(self):
+    async def _read_replies(self) -> None:
         with self._reader_scope:
             await self._read_replies_until_closed()
 
-    async def _read_replies_until_closed(self):
+    async def _read_replies_until_closed(self) -> None:
         try:
             while True:
-                (size,) = _LENGTH.unpack(await self._stdout.receive_exactly(_LENGTH.size))
-                request_id, reply = pickle.loads(await self._stdout.receive_exactly(size))
+                (size,) = _LENGTH.unpack(
+                    await self._stdout.receive_exactly(_LENGTH.size)
+                )
+                request_id, reply = pickle.loads(
+                    await self._stdout.receive_exactly(size)
+                )
                 if pending := self._pending.get(request_id):
                     pending.reply = reply
                     pending.done.set()
-        except (anyio.EndOfStream, anyio.IncompleteRead, anyio.BrokenResourceError):
-            error = None
+        except (
+            anyio.EndOfStream,
+            anyio.IncompleteRead,
+            anyio.BrokenResourceError,
+        ):
+            error: BaseException | None = None
         except Exception as exc:
             error = exc
         self._closed = True
@@ -456,7 +494,7 @@ class BaseWorker(ABC):
                 pending.error = error
                 pending.done.set()
 
-    async def _send(self, request_id, command):
+    async def _send(self, request_id: int, command: tuple[Any, ...]) -> None:
         data = pickle.dumps((request_id, pickle.dumps(command)))
         async with self._send_lock:
             # Close iterators abandoned by RemoteIterator.__del__; nothing
@@ -464,14 +502,17 @@ class BaseWorker(ABC):
             closes = []
             while self._abandoned_iterators:
                 close = ("close", self._abandoned_iterators.pop())
-                closes.append(pickle.dumps((next(self._request_ids), pickle.dumps(close))))
-            # A send interrupted partway would leave half a request in the stream.
+                closes.append(
+                    pickle.dumps((next(self._request_ids), pickle.dumps(close)))
+                )
+            # A send interrupted partway would leave half a request in the
+            # stream.
 
             # XXX: but is this actually quite what we want?? We might
             # still want some kind of timeout... Hm.
             await protected(self._stdin.send(b"".join(closes) + data))
 
-    async def _call(self, command):
+    async def _call(self, command: tuple[Any, ...]) -> Any:
         if self._closed:
             raise EOFError(await self._closed_message())
         request_id = next(self._request_ids)
@@ -483,19 +524,37 @@ class BaseWorker(ABC):
             if not pending.done.is_set() and not self._closed:
                 # We are already cancelled, and taking the send lock is an
                 # anyio checkpoint, so the whole send has to be protected.
-                await protected(self._send(next(self._request_ids), ("cancel", request_id)))
+                await protected(
+                    self._send(next(self._request_ids), ("cancel", request_id))
+                )
             raise
         finally:
             del self._pending[request_id]
         if pending.error is not None:
             raise pending.error
+        assert pending.reply is not None
         return unwrap_reply(pending.reply)
 
-    async def run(self, func, *args, **kwargs):
+    @overload
+    async def run[**P, R](
+        self, func: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs
+    ) -> R: ...
+    @overload
+    async def run[**P, R](
+        self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
+    ) -> R: ...
+    async def run(
+        self, func: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
         return await self._call(("run", func, args, kwargs))
 
-    def iterate(self, func, *args, **kwargs):
-        """Iterate remotely over ``func(*args, **kwargs)``, one item per round trip.
+    def iterate[**P, T](
+        self,
+        func: Callable[P, Iterable[T] | AsyncIterable[T]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> RemoteIterator[T]:
+        """Iterate remotely over ``func(*args, **kwargs)``, an item per trip.
 
         Use ``async with`` to close the remote iterator if you stop early;
         otherwise it stays open in the worker until the worker exits.
@@ -503,20 +562,26 @@ class BaseWorker(ABC):
         return RemoteIterator(self, func, args, kwargs)
 
 
-class RemoteIterator:
+class RemoteIterator[T]:
     """An async iterator over a sync or async iterable in a worker."""
 
-    def __init__(self, worker, func, args, kwargs):
+    def __init__(
+        self,
+        worker: BaseWorker,
+        func: Callable[..., Iterable[T] | AsyncIterable[T]],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
         self._worker = worker
         self._call_args = (func, args, kwargs)
         self._id = next(worker._iter_ids)
         self._started = False
         self._finished = False
 
-    def __aiter__(self):
+    def __aiter__(self) -> Self:
         return self
 
-    async def __anext__(self):
+    async def __anext__(self) -> T:
         if self._finished:
             raise StopAsyncIteration
         try:
@@ -530,21 +595,21 @@ class RemoteIterator:
         if kind == "done":
             self._finished = True
             raise StopAsyncIteration
-        return value
+        return value  # type: ignore[no-any-return]
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         if self._started and not self._finished:
             self._finished = True
             await protected(self._worker._call(("close", self._id)))
         self._finished = True
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, *exc_info):
+    async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
 
-    def __del__(self):
+    def __del__(self) -> None:
         if self._started and not self._finished:
             self._worker._abandoned_iterators.append(self._id)
 
@@ -552,24 +617,31 @@ class RemoteIterator:
 class LocalWorker(BaseWorker):
     """A worker subprocess on this machine."""
 
-    def __init__(self, main_path=None, *, python=sys.executable):
+    def __init__(
+        self, main_path: str | None = None, *, python: str = sys.executable
+    ) -> None:
         super().__init__(main_path)
         self._python = python
 
-    async def __aenter__(self):
-        self._proc = await anyio.open_process([self._python, __file__], stderr=None)
+    async def __aenter__(self) -> Self:
+        self._proc = await anyio.open_process(
+            [self._python, __file__], stderr=None
+        )
         try:
+            assert (
+                self._proc.stdin is not None and self._proc.stdout is not None
+            )
             await self._start(self._proc.stdin, self._proc.stdout)
         except BaseException:
             await self._proc.aclose()
             raise
         return self
 
-    async def __aexit__(self, *exc_info):
+    async def __aexit__(self, *exc_info: object) -> None:
         await self._stop()
         await self._proc.aclose()
 
-    async def _closed_message(self):
+    async def _closed_message(self) -> str:
         return f"worker exited with {await self._proc.wait()}"
 
 
@@ -579,9 +651,18 @@ class SandboxWorker(BaseWorker):
     ``main_path`` is a local path inside ``src_dir``.
     """
 
-    def __init__(self, box, main_path=None, *, src_dir=".", target_dir="workspace", env=None):
+    def __init__(
+        self,
+        box: Sandbox,
+        main_path: str | None = None,
+        *,
+        src_dir: StrPath = ".",
+        target_dir: str = "workspace",
+        env: dict[str, str] | None = None,
+    ) -> None:
         if main_path is None:
             main_path = sys.modules["__main__"].__file__
+            assert main_path is not None
         remote_main = os.path.relpath(main_path, src_dir)
         if remote_main.startswith(os.pardir):
             raise ValueError(f"{main_path} is not inside {src_dir}")
@@ -591,46 +672,51 @@ class SandboxWorker(BaseWorker):
         self._target_dir = target_dir
         self._env = env
 
-    def _uv_args(self):
+    def _uv_args(self) -> list[str]:
         python = f"{sys.version_info.major}.{sys.version_info.minor}"
         script = Path(os.path.relpath(__file__, self._src_dir)).as_posix()
         return ["uv", "run", "--python", python, script]
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> Self:
         await sync_dir(self._box, self._src_dir, self._target_dir)
         uv, *args = self._uv_args()
-        self._cmd = await self._box.create_command(
+        self._cmd: Command = await self._box.create_command(
             uv,
             [*args, "--base64"],
             cwd=self._target_dir,
             env=self._env,
             stdin=subprocess.PIPE,
         )
+        assert self._cmd.stdin is not None and self._cmd.stdout is not None
         try:
-            await self._start(self._cmd.stdin, Base64ByteReceiveStream(self._cmd.stdout))
+            await self._start(
+                self._cmd.stdin, Base64ByteReceiveStream(self._cmd.stdout)
+            )
         except BaseException:
             await protected(self._cmd.kill())
             raise
         return self
 
-    async def __aexit__(self, *exc_info):
+    async def __aexit__(self, *exc_info: object) -> None:
         await self._stop()
         try:
+            assert self._cmd.stdin is not None
             await self._cmd.stdin.aclose()
             await self._cmd.wait()
         except Exception as exc:
             if not _sandbox_stopped(exc):
                 raise
         await self._stdout.aclose()
-        await self._cmd.stderr.aclose()
+        if self._cmd.stderr is not None:
+            await self._cmd.stderr.aclose()
 
-    async def _closed_message(self):
+    async def _closed_message(self) -> str:
         returncode = await self._cmd.wait()
-        stderr = await self._cmd.stderr.read()
+        stderr = await self._cmd.stderr.read() if self._cmd.stderr else ""
         return f"worker exited with {returncode}\n{stderr}"
 
 
-def _sandbox_stopped(exc):
+def _sandbox_stopped(exc: BaseException | None) -> bool:
     """Whether ``exc`` (or its cause) says the sandbox is already gone."""
     while exc is not None:
         if getattr(exc, "code", None) == "sandbox_stopped":
@@ -647,7 +733,7 @@ class PtySandboxWorker(SandboxWorker):
 
     _READY = b"RUN_SYNC_READY\n"
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> Self:
         await sync_dir(self._box, self._src_dir, self._target_dir)
         self._stderr_path = f"/tmp/run_sync-{os.urandom(4).hex()}.err"
         script = (
@@ -657,8 +743,10 @@ class PtySandboxWorker(SandboxWorker):
         )
         self._stack = AsyncExitStack()
         try:
-            self._pty = await self._stack.enter_async_context(
-                self._box.open_interactive("sh", ["-c", script])
+            self._pty: InteractiveSession = (
+                await self._stack.enter_async_context(
+                    self._box.open_interactive("sh", ["-c", script])
+                )
             )
             stdout = BufferedByteReceiveStream(self._pty.stream)
             await stdout.receive_until(self._READY, 65536)
@@ -668,11 +756,11 @@ class PtySandboxWorker(SandboxWorker):
             raise
         return self
 
-    async def __aexit__(self, *exc_info):
+    async def __aexit__(self, *exc_info: object) -> None:
         await self._stop()
         await self._stack.aclose()
 
-    async def _closed_message(self):
+    async def _closed_message(self) -> str:
         returncode = await self._pty.wait()
         stderr = await self._box.fs.read_text(self._stderr_path)
         return f"worker exited with {returncode}\n{stderr}"
@@ -680,5 +768,9 @@ class PtySandboxWorker(SandboxWorker):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base64", action="store_true", help="base64-encode replies, one per line")
+    parser.add_argument(
+        "--base64",
+        action="store_true",
+        help="base64-encode replies, one per line",
+    )
     worker(b64=parser.parse_args().base64)

@@ -131,11 +131,11 @@ class SandboxAgent(ai.Agent):
                 yield x
         else:
             async with worker.iterate(_remote_loop, self, context) as s:
-                async for x in s:
-                    if isinstance(x, _Added):
-                        context.messages.extend(x.messages)
+                async for item in s:
+                    if isinstance(item, _Added):
+                        context.messages.extend(item.messages)
                     else:
-                        yield x
+                        yield item
 
 
 @contextlib.asynccontextmanager

@@ -24,7 +24,6 @@ ai = { git = "https://github.com/vercel-labs/ai-python", branch = "sandbox-fixes
 
 [tool.ruff]
 line-length = 80
-extend-exclude = ["tau/run_sandbox.py"]
 target-version = "py312"
 
 [tool.ruff.lint]
