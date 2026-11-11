@@ -31,7 +31,7 @@ import ai.agents.runtime
 from vercel import sandbox
 from vercel.api import session
 
-from tau import run_sandbox
+from tau import run_sandbox, run_vercel_sandbox
 
 _REPO_ROOT = pathlib.Path(run_sandbox.__file__).parent.parent
 
@@ -236,7 +236,7 @@ def _install_hook_registry() -> None:
 @contextlib.asynccontextmanager
 async def sandbox_worker(
     mode: Mode = "loop",
-) -> AsyncIterator[run_sandbox.SandboxWorker]:
+) -> AsyncIterator[run_vercel_sandbox.SandboxWorker]:
     """Create a sandbox running a worker on a copy of the repo.
 
     The worker is the ambient sandbox worker, in ``mode``, until exit.
@@ -244,7 +244,7 @@ async def sandbox_worker(
     async with (
         session(),
         sandbox.create_sandbox() as box,
-        run_sandbox.SandboxWorker(
+        run_vercel_sandbox.SandboxWorker(
             box, run_sandbox.__file__, src_dir=str(_REPO_ROOT)
         ) as worker,
     ):
