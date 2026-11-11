@@ -1442,9 +1442,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sandbox",
-        action="store_true",
-        default=False,
-        help="Run all tools, unapproved, in a remote Vercel sandbox.",
+        nargs="?",
+        const="loop",
+        choices=["loop", "tools"],
+        default=None,
+        help=(
+            "Run in a remote Vercel sandbox, with tools unapproved: the whole"
+            " agent loop (loop, the default) or just the tools (tools)."
+        ),
     )
     return parser.parse_args()
 
@@ -1484,14 +1489,16 @@ def main() -> None:
             sys.exit(1)
 
     if args.sandbox:
-        asyncio.run(_run_sandboxed(resume_path))
+        asyncio.run(_run_sandboxed(resume_path, args.sandbox))
     else:
         TauApp(resume_path=resume_path).run()
 
 
-async def _run_sandboxed(resume_path: pathlib.Path | None) -> None:
+async def _run_sandboxed(
+    resume_path: pathlib.Path | None, mode: sandbox.Mode
+) -> None:
     print("starting sandbox…", file=sys.stderr)
-    async with sandbox.sandbox_worker():
+    async with sandbox.sandbox_worker(mode):
         app = TauApp(resume_path=resume_path, require_approval=False)
         await app.run_async()
 

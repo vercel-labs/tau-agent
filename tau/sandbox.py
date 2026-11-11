@@ -4,7 +4,8 @@
 ``run_sandbox`` worker there, and makes it the ambient worker.
 ``SandboxAgent``'s tools run in the ambient worker when there is one,
 so they see the sandbox's filesystem and run its shell commands, and
-run locally otherwise.
+run locally otherwise.  In ``"loop"`` mode the whole agent loop runs
+in the worker, tools included; in ``"tools"`` mode only the tools do.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from collections.abc import (
     Callable,
     Sequence,
 )
-from typing import Any
+from typing import Any, Literal
 
 import ai
 import ai.agents.agent
@@ -32,8 +33,13 @@ from tau import run_sandbox
 
 _REPO_ROOT = pathlib.Path(run_sandbox.__file__).parent.parent
 
+type Mode = Literal["tools", "loop"]
+
 _worker: contextvars.ContextVar[run_sandbox.BaseWorker | None] = (
     contextvars.ContextVar("tau_sandbox_worker", default=None)
+)
+_mode: contextvars.ContextVar[Mode] = contextvars.ContextVar(
+    "tau_sandbox_mode", default="loop"
 )
 
 
@@ -126,7 +132,7 @@ class SandboxAgent(ai.Agent):
         self, context: ai.Context
     ) -> AsyncGenerator[ai.events.AgentEvent]:
         worker = _worker.get()
-        if worker is None:
+        if worker is None or _mode.get() == "tools":
             async for x in super().loop(context):
                 yield x
         else:
@@ -139,10 +145,12 @@ class SandboxAgent(ai.Agent):
 
 
 @contextlib.asynccontextmanager
-async def sandbox_worker() -> AsyncIterator[run_sandbox.SandboxWorker]:
+async def sandbox_worker(
+    mode: Mode = "loop",
+) -> AsyncIterator[run_sandbox.SandboxWorker]:
     """Create a sandbox running a worker on a copy of the repo.
 
-    The worker is the ambient sandbox worker until exit.
+    The worker is the ambient sandbox worker, in ``mode``, until exit.
     """
     async with (
         session(),
@@ -152,7 +160,9 @@ async def sandbox_worker() -> AsyncIterator[run_sandbox.SandboxWorker]:
         ) as worker,
     ):
         token = _worker.set(worker)
+        mode_token = _mode.set(mode)
         try:
             yield worker
         finally:
+            _mode.reset(mode_token)
             _worker.reset(token)
