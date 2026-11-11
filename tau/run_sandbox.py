@@ -7,10 +7,10 @@ answered. Commands:
 
 * ``("init", main_path)`` loads ``main_path`` as the ``__main__`` module, so
   functions pickled by reference to ``__main__`` resolve.
-* ``("run", func, args, kwargs)`` calls ``func(*args, **kwargs)``. If that
+* ``("run", func, args)`` calls ``func(*args)``. If that
   returns an awaitable, such as from a coroutine function, it runs as a task on
   the worker's event loop, concurrently with other requests.
-* ``("iter", id, func, args, kwargs)`` calls ``func(*args, **kwargs)`` and
+* ``("iter", id, func, args)`` calls ``func(*args)`` and
   keeps the result, a sync or async generator or any iterable, under ``id``.
 * ``("next", id)`` advances iterator ``id``, replying ``("yield", value)`` or,
   once it is exhausted, ``("done", return_value)``.
@@ -277,11 +277,11 @@ class _Server:
             case ("init", path):
                 _load_main(path)
                 return False, None
-            case ("run", func, args, kwargs):
-                result = func(*args, **kwargs)
+            case ("run", func, args):
+                result = func(*args)
                 return inspect.isawaitable(result), result
-            case ("iter", iter_id, func, args, kwargs):
-                result = func(*args, **kwargs)
+            case ("iter", iter_id, func, args):
+                result = func(*args)
                 self._iterators[iter_id] = (
                     result
                     if isinstance(result, AsyncIterator)
@@ -517,30 +517,25 @@ class Worker:
         return unwrap_reply(pending.reply)
 
     @overload
-    async def run[**P, R](
-        self, func: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs
+    async def run[*Ts, R](
+        self, func: Callable[[*Ts], Awaitable[R]], *args: *Ts
     ) -> R: ...
     @overload
-    async def run[**P, R](
-        self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
-    ) -> R: ...
-    async def run(
-        self, func: Callable[..., Any], *args: Any, **kwargs: Any
-    ) -> Any:
-        return await self._call(("run", func, args, kwargs))
+    async def run[*Ts, R](self, func: Callable[[*Ts], R], *args: *Ts) -> R: ...
+    async def run[*Ts](self, func: Callable[[*Ts], Any], *args: *Ts) -> Any:
+        return await self._call(("run", func, args))
 
-    def iterate[**P, T](
+    def iterate[*Ts, T](
         self,
-        func: Callable[P, Iterable[T] | AsyncIterable[T]],
-        *args: P.args,
-        **kwargs: P.kwargs,
+        func: Callable[[*Ts], Iterable[T] | AsyncIterable[T]],
+        *args: *Ts,
     ) -> RemoteIterator[T]:
-        """Iterate remotely over ``func(*args, **kwargs)``, an item per trip.
+        """Iterate remotely over ``func(*args)``, an item per trip.
 
         Use ``async with`` to close the remote iterator if you stop early;
         otherwise it stays open in the worker until the worker exits.
         """
-        return RemoteIterator(self, func, args, kwargs)
+        return RemoteIterator(self, func, args)
 
 
 class RemoteIterator[T]:
@@ -551,10 +546,9 @@ class RemoteIterator[T]:
         worker: Worker,
         func: Callable[..., Iterable[T] | AsyncIterable[T]],
         args: tuple[Any, ...],
-        kwargs: dict[str, Any],
     ) -> None:
         self._worker = worker
-        self._call_args = (func, args, kwargs)
+        self._call_args = (func, args)
         self._id = next(worker._iter_ids)
         self._started = False
         self._finished = False

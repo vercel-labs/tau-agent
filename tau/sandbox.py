@@ -50,25 +50,21 @@ class Worker(Protocol):
 
     Arguments, results and the functions themselves are pickled.  A
     sync function's context variable changes are seen by later calls.
+    Only positional arguments are passed through, leaving keywords free
+    for the worker's own options; use ``functools.partial`` for others.
     """
 
     @overload
-    async def run[**P, R](
-        self,
-        func: Callable[P, Awaitable[R]],
-        *args: P.args,
-        **kwargs: P.kwargs,
+    async def run[*Ts, R](
+        self, func: Callable[[*Ts], Awaitable[R]], *args: *Ts
     ) -> R: ...
     @overload
-    async def run[**P, R](
-        self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
-    ) -> R: ...
+    async def run[*Ts, R](self, func: Callable[[*Ts], R], *args: *Ts) -> R: ...
 
-    def iterate[**P, T](
+    def iterate[*Ts, T](
         self,
-        func: Callable[P, Iterable[T] | AsyncIterable[T]],
-        *args: P.args,
-        **kwargs: P.kwargs,
+        func: Callable[[*Ts], Iterable[T] | AsyncIterable[T]],
+        *args: *Ts,
     ) -> RemoteIterator[T]: ...
 
 
@@ -84,9 +80,10 @@ def _dispatch(fn: Callable[..., Any], streaming: bool, /, **kwargs: Any) -> Any:
     worker = _worker.get()
     if worker is None:
         return fn(**kwargs)
+    call = functools.partial(fn, **kwargs)
     if streaming:
-        return worker.iterate(fn, **kwargs)
-    return worker.run(fn, **kwargs)
+        return worker.iterate(call)
+    return worker.run(call)
 
 
 def _wrap_tool(
