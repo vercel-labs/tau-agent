@@ -15,10 +15,13 @@ answered. Commands:
 * ``("next", id)`` advances iterator ``id``, replying ``("yield", value)`` or,
   once it is exhausted, ``("done", return_value)``.
 * ``("close", id)`` closes iterator ``id`` early.
-* ``("stream", func, args)`` iterates over ``func(*args)`` without waiting to
-  be asked, replying ``("yield", value)`` for each item and then
-  ``("done", return_value)``, all under the one request id. Cancelling the
-  request closes the iterator.
+* ``("stream", func, args, window)`` iterates over ``func(*args)`` without
+  waiting to be asked, replying ``("yield", value)`` for each item and then
+  ``("done", return_value)``, all under the one request id. Each item uses up
+  a credit, of which there are ``window`` to start with; with none left, the
+  iterator isn't advanced until more arrive. Cancelling the request closes the
+  iterator.
+* ``("credit", request_id, n)`` gives stream ``request_id`` ``n`` more credits.
 * ``("cancel", request_id)`` cancels that request's task, if it is still
   running. Cancelled requests get no reply.
 
@@ -77,6 +80,8 @@ from anyio.streams.memory import (
 )
 
 _LENGTH = struct.Struct(">Q")
+
+DEFAULT_WINDOW = 256
 
 
 async def protected[T](arg: Awaitable[T]) -> T:
@@ -246,6 +251,7 @@ class _Server:
         self._b64 = b64
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._iterators: dict[int, Iterator[Any] | AsyncIterator[Any]] = {}
+        self._credits: dict[int, _Credits] = {}
         task = asyncio.current_task()
         assert task is not None
         self._root_context = task.get_context()
@@ -271,8 +277,10 @@ class _Server:
                     self._finish(request_id, value)
                 )
             case "stream":
+                it, window = value
+                credits = self._credits[request_id] = _Credits(window)
                 self._tasks[request_id] = asyncio.create_task(
-                    self._stream(request_id, value)
+                    self._stream(request_id, it, credits)
                 )
 
     async def _finish(self, request_id: int, awaitable: Awaitable[Any]) -> None:
@@ -288,11 +296,14 @@ class _Server:
             self._tasks.pop(request_id, None)
 
     async def _stream(
-        self, request_id: int, it: Iterator[Any] | AsyncIterator[Any]
+        self,
+        request_id: int,
+        it: Iterator[Any] | AsyncIterator[Any],
+        credits: _Credits,
     ) -> None:
         try:
             try:
-                value = await self._drain(request_id, it)
+                value = await self._drain(request_id, it, credits)
             finally:
                 if isinstance(it, AsyncIterator):
                     if hasattr(it, "aclose"):
@@ -307,9 +318,13 @@ class _Server:
             self._reply(request_id, "ok", ("done", value))
         finally:
             self._tasks.pop(request_id, None)
+            self._credits.pop(request_id, None)
 
     async def _drain(
-        self, request_id: int, it: Iterator[Any] | AsyncIterator[Any]
+        self,
+        request_id: int,
+        it: Iterator[Any] | AsyncIterator[Any],
+        credits: _Credits,
     ) -> Any:
         """Send each item of ``it``, and return its return value.
 
@@ -317,6 +332,7 @@ class _Server:
         item that fails to pickle raises, ending the stream.
         """
         while True:
+            await credits.take()
             if isinstance(it, AsyncIterator):
                 try:
                     item = await it.__anext__()
@@ -339,8 +355,8 @@ class _Server:
 
     def _handle(self, command: tuple[Any, ...]) -> tuple[str, Any]:
         """Return ``("value", value)`` to reply with, ``("await",
-        awaitable)`` to await and reply with, or ``("stream", iterator)``
-        to stream."""
+        awaitable)`` to await and reply with, or ``("stream", (iterator,
+        window))`` to stream."""
         match command:
             case ("init", path):
                 _load_main(path)
@@ -353,8 +369,12 @@ class _Server:
             case ("iter", iter_id, func, args):
                 self._iterators[iter_id] = _as_iterator(func(*args))
                 return "value", None
-            case ("stream", func, args):
-                return "stream", _as_iterator(func(*args))
+            case ("stream", func, args, window):
+                return "stream", (_as_iterator(func(*args)), window)
+            case ("credit", target, n):
+                if credits := self._credits.get(target):
+                    credits.add(n)
+                return "value", None
             case ("next", iter_id):
                 it = self._iterators[iter_id]
                 if isinstance(it, AsyncIterator):
@@ -395,6 +415,24 @@ class _Server:
         except BaseException:
             self._iterators.pop(iter_id, None)
             raise
+
+
+class _Credits:
+    """How many more items a stream may send."""
+
+    def __init__(self, n: int) -> None:
+        self._n = n
+        self._added = asyncio.Event()
+
+    def add(self, n: int) -> None:
+        self._n += n
+        self._added.set()
+
+    async def take(self) -> None:
+        while self._n == 0:
+            self._added.clear()
+            await self._added.wait()
+        self._n -= 1
 
 
 def _as_iterator(
@@ -604,7 +642,8 @@ class Worker:
         """Send ``command`` and return its id and a stream of its replies.
 
         The stream also gets the error if the worker goes away.  Each
-        reply is buffered until it is received, however many there are.
+        reply is buffered until it is received, so the command should
+        limit how many it gets.
         """
         if self._closed:
             raise EOFError(await self._closed_message())
@@ -646,17 +685,25 @@ class Worker:
         func: Callable[[*Ts], Iterable[T] | AsyncIterable[T]],
         *args: *Ts,
         free_running: bool = False,
+        window: int = DEFAULT_WINDOW,
     ) -> RemoteIterator[T]:
         """Iterate remotely over ``func(*args)``, an item per trip.
 
         With ``free_running``, the worker advances the iterator without
         waiting to be asked and sends each item as it comes, saving a
-        round trip per item; items not yet taken are buffered here.
+        round trip per item.  Up to ``window`` items not yet taken are
+        buffered here; with that many, the worker waits.  Credit for
+        more goes back once half the window has been taken, so a window
+        that covers a round trip's worth of items never stalls.
 
         Use ``async with`` to close the remote iterator if you stop early;
         otherwise it stays open in the worker until the worker exits.
         """
-        return RemoteIterator(self, func, args, free_running=free_running)
+        if window < 1:
+            raise ValueError(f"window must be at least 1, not {window}")
+        return RemoteIterator(
+            self, func, args, free_running=free_running, window=window
+        )
 
 
 class RemoteIterator[T]:
@@ -669,10 +716,13 @@ class RemoteIterator[T]:
         args: tuple[Any, ...],
         *,
         free_running: bool = False,
+        window: int = DEFAULT_WINDOW,
     ) -> None:
         self._worker = worker
         self._call_args = (func, args)
         self._free_running = free_running
+        self._window = window
+        self._taken = 0
         self._id = next(worker._iter_ids)
         self._request_id = -1
         self._replies: MemoryObjectReceiveStream[bytes | BaseException] | None
@@ -710,9 +760,17 @@ class RemoteIterator[T]:
         if not self._started:
             self._started = True
             self._request_id, self._replies = await self._worker._open_stream(
-                ("stream", *self._call_args)
+                ("stream", *self._call_args, self._window)
             )
         assert self._replies is not None
+        # Credit is sent here, not as an item is returned, so that a failed
+        # send can't lose an item already received.
+        if self._taken >= max(1, self._window // 2):
+            credit = ("credit", self._request_id, self._taken)
+            self._taken = 0
+            await protected(
+                self._worker._send(next(self._worker._request_ids), credit)
+            )
         ended = False
         try:
             reply = await self._replies.receive()
@@ -723,6 +781,8 @@ class RemoteIterator[T]:
             ended = status == "err" or value[0] == "done"
             if status == "err":
                 raise value
+            if value[0] == "yield":
+                self._taken += 1
             return value  # type: ignore[no-any-return]
         finally:
             if ended:
