@@ -10,12 +10,19 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator, Iterable
 from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import timedelta
 from os import PathLike
 from pathlib import Path
 
 from anyio.abc import ByteReceiveStream, ByteSendStream
 from anyio.streams.buffered import BufferedByteReceiveStream
-from vercel.sandbox import Command, InteractiveSession, Sandbox
+from vercel.sandbox import (
+    Command,
+    InteractiveSession,
+    Sandbox,
+    create_sandbox,
+    get_or_create_sandbox,
+)
 
 from tau import run_sandbox
 from tau.run_sandbox import (
@@ -26,6 +33,39 @@ from tau.run_sandbox import (
 )
 
 type StrPath = str | PathLike[str]
+
+
+@asynccontextmanager
+async def open_sandbox(
+    name: str | None = None, *, execution_time_limit: timedelta | None = None
+) -> AsyncIterator[tuple[Sandbox, bool]]:
+    """Yield a sandbox, and whether it was just created.
+
+    With no ``name``, a fresh sandbox that is destroyed on exit.  With
+    one, the persistent sandbox of that name, created if need be and
+    stopped on exit; stopping snapshots its filesystem, which comes back
+    the next time it's opened.  ``execution_time_limit`` applies to a
+    reopened sandbox too.
+    """
+    if name is None:
+        async with create_sandbox(
+            persistent=False, execution_time_limit=execution_time_limit
+        ) as box:
+            yield box, True
+        return
+    box, created = await get_or_create_sandbox(
+        name=name, persistent=True, execution_time_limit=execution_time_limit
+    )
+    try:
+        if not created and execution_time_limit is not None:
+            await box.update(execution_time_limit=execution_time_limit)
+        yield box, created
+    finally:
+        try:
+            await protected(box.stop())
+        except Exception as exc:
+            if not _sandbox_stopped(exc):
+                raise
 
 
 async def sync_dir(box: Sandbox, src_dir: StrPath, target_dir: str) -> None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import datetime
 import json
 import os
 import pathlib
@@ -40,7 +41,6 @@ import textual.events
 import textual.message
 import textual.widgets
 import textual.worker
-from vercel import sandbox as vercel_sandbox
 from vercel.api import session as vercel_session
 
 from tau import run_sandbox, run_vercel_sandbox, sandbox, session, tools
@@ -1459,6 +1459,26 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Run all tools without asking for approval.",
     )
+    parser.add_argument(
+        "--sandbox-name",
+        metavar="NAME",
+        default=None,
+        help=(
+            "Use the persistent sandbox NAME, creating it if need be, and"
+            " keep it on exit.  The current directory is copied in only when"
+            " it's created.  Without this, the sandbox is thrown away."
+        ),
+    )
+    parser.add_argument(
+        "--sandbox-timeout",
+        metavar="MINUTES",
+        type=int,
+        default=45,
+        help=(
+            "Stop the sandbox's session after MINUTES (default 45, the most"
+            " the Hobby plan allows)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1498,7 +1518,15 @@ def main() -> None:
 
     require_approval = False if args.no_approval else None
     if args.sandbox:
-        asyncio.run(_run_sandboxed(resume_path, args.sandbox, require_approval))
+        asyncio.run(
+            _run_sandboxed(
+                resume_path,
+                args.sandbox,
+                require_approval,
+                name=args.sandbox_name,
+                timeout=datetime.timedelta(minutes=args.sandbox_timeout),
+            )
+        )
     else:
         TauApp(resume_path=resume_path, require_approval=require_approval).run()
 
@@ -1507,22 +1535,30 @@ async def _run_sandboxed(
     resume_path: pathlib.Path | None,
     mode: sandbox.Mode,
     require_approval: bool | None,
+    *,
+    name: str | None,
+    timeout: datetime.timedelta,
 ) -> None:
     """Run tau with the ambient worker in a Vercel sandbox.
 
     The sandbox gets a copy of tau, which the worker runs, and a copy of
-    the current directory, which the worker runs in.
+    the current directory, which the worker runs in.  A reopened named
+    sandbox keeps the copy of the current directory it has.
     """
     print("starting sandbox…", file=sys.stderr)
     repo_root = pathlib.Path(run_sandbox.__file__).parent.parent
     async with (
         vercel_session(),
-        vercel_sandbox.create_sandbox() as box,
+        run_vercel_sandbox.open_sandbox(name, execution_time_limit=timeout) as (
+            box,
+            created,
+        ),
         run_vercel_sandbox.sandbox_worker(
             box, run_sandbox.__file__, src_dir=str(repo_root)
         ) as worker,
     ):
-        await run_vercel_sandbox.sync_project(box, os.getcwd(), "project")
+        if created:
+            await run_vercel_sandbox.sync_project(box, os.getcwd(), "project")
         home = pathlib.PurePosixPath(await worker.run(os.getcwd)).parent
         await worker.run(os.chdir, str(home / "project"))
         async with sandbox.use_worker(worker, mode):
