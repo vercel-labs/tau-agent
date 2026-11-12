@@ -27,6 +27,8 @@ import traceback
 from typing import Any
 
 import ai
+import ai.contrib.sandbox.vercel
+import ai.contrib.sandbox.worker
 import ai.errors
 import ai.types.usage
 import pydantic
@@ -43,7 +45,7 @@ import textual.widgets
 import textual.worker
 from vercel.api import session as vercel_session
 
-from tau import run_sandbox, run_vercel_sandbox, session, tools
+from tau import sandbox, session, tools
 
 _raw_model = os.environ.get("TAU_MODEL", "gateway:anthropic/claude-opus-5.5")
 MODEL_ID = _raw_model if ":" in _raw_model else f"gateway:{_raw_model}"
@@ -1552,25 +1554,25 @@ async def _run_sandboxed(
 ) -> None:
     """Run tau with the ambient worker in a Vercel sandbox.
 
-    The sandbox gets a copy of tau and its local path dependencies,
-    which the worker runs, and a copy of the current directory, which
-    the worker runs in.  A reopened named
-    sandbox keeps the copy of the current directory it has.
+    The sandbox gets a copy of tau and its local path dependencies, for
+    the worker's environment, and a copy of the current directory, which
+    the worker runs in.  A reopened named sandbox keeps the copy of the
+    current directory it has.
     """
     print("starting sandbox…", file=sys.stderr)
-    repo_root = pathlib.Path(run_sandbox.__file__).parent.parent
+    repo_root = pathlib.Path(__file__).parent.parent
     async with (
         vercel_session(),
-        run_vercel_sandbox.open_sandbox(name, execution_time_limit=timeout) as (
+        sandbox.open_sandbox(name, execution_time_limit=timeout) as (
             box,
             created,
         ),
-        run_vercel_sandbox.sandbox_worker(
-            box, run_sandbox.__file__, src_dir=str(repo_root)
+        ai.contrib.sandbox.worker.Worker(
+            ai.contrib.sandbox.vercel.sandbox_process(box, src_dir=repo_root)
         ) as worker,
     ):
         if created:
-            await run_vercel_sandbox.sync_project(box, os.getcwd(), "project")
+            await sandbox.sync_project(box, os.getcwd(), "project")
         home = pathlib.PurePosixPath(await worker.run(os.getcwd)).parent
         await worker.run(os.chdir, str(home / "project"))
         with ai.remote.use_worker(worker, mode):
