@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import importlib.metadata
 import os
@@ -18,7 +19,8 @@ from os import PathLike
 from pathlib import Path
 from typing import Any
 
-from anyio.abc import ByteReceiveStream, ByteSendStream
+import anyio
+from anyio.abc import ByteReceiveStream, ByteSendStream, ObjectReceiveStream
 from anyio.streams.buffered import BufferedByteReceiveStream
 from vercel.sandbox import (
     Command,
@@ -29,12 +31,7 @@ from vercel.sandbox import (
 )
 
 from tau import run_sandbox
-from tau.run_sandbox import (
-    Base64ByteReceiveStream,
-    Process,
-    Worker,
-    protected,
-)
+from tau.run_sandbox import Process, Worker, protected
 
 type StrPath = str | PathLike[str]
 
@@ -201,10 +198,64 @@ def _remote_main(main_path: str | None, src_dir: StrPath) -> str:
     return Path(remote_main).as_posix()
 
 
+# Sandbox command output is decoded as text, so the worker's binary stdout
+# is piped through this, which base64-encodes each chunk onto its own line.
+_BASE64_ENCODER = """\
+import base64, sys
+while data := sys.stdin.buffer.read1():
+    sys.stdout.buffer.write(base64.b64encode(data) + b"\\n")
+    sys.stdout.buffer.flush()
+"""
+
+
 def _uv_args(src_dir: StrPath) -> list[str]:
-    python = f"{sys.version_info.major}.{sys.version_info.minor}"
     script = Path(os.path.relpath(run_sandbox.__file__, src_dir)).as_posix()
-    return ["uv", "run", "--python", python, script]
+    return ["uv", "run", "--python", _python_version(), script]
+
+
+def _python_version() -> str:
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def _worker_script(src_dir: StrPath) -> str:
+    worker = shlex.join(_uv_args(src_dir))
+    encoder = shlex.join(
+        ["uv", "run", "--no-project", "--python", _python_version()]
+        + ["python", "-c", _BASE64_ENCODER]
+    )
+    return f"set -o pipefail; {worker} | {encoder}"
+
+
+class Base64ByteReceiveStream(ByteReceiveStream):
+    """Decode newline-terminated base64 lines from a stream of text."""
+
+    def __init__(self, stream: ObjectReceiveStream[str]) -> None:
+        self._stream = stream
+        self._text = ""
+        self._data = b""
+        self._eof = False
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        while not self._data:
+            line, newline, rest = self._text.partition("\n")
+            if newline:
+                self._text = rest
+            elif self._eof:
+                self._text = ""
+                if not line.strip():
+                    raise anyio.EndOfStream
+            else:
+                try:
+                    self._text += await self._stream.receive()
+                except anyio.EndOfStream:
+                    self._eof = True
+                continue
+            self._data = base64.b64decode(line.strip(), validate=True)
+        data, self._data = self._data[:max_bytes], self._data[max_bytes:]
+        return data
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
 
 
 @dataclasses.dataclass
@@ -232,10 +283,9 @@ async def sandbox_process(
     The copy is made by ``sync_workspace``.
     """
     sync_env = await sync_workspace(box, src_dir, target_dir)
-    uv, *args = _uv_args(src_dir)
     cmd = await box.create_command(
-        uv,
-        [*args, "--base64"],
+        "bash",
+        ["-c", _worker_script(src_dir)],
         cwd=target_dir,
         env={**sync_env, **(env or {})},
         stdin=subprocess.PIPE,

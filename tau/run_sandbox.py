@@ -34,15 +34,11 @@ Every other request but ``stream`` gets exactly one reply,
 ``(request_id, reply)`` with ``reply`` a pickled ``("ok", value)`` or
 ``("err", exc)``. Replies arrive as requests finish, in any order. Each is
 framed as an 8-byte big-endian length followed by the pickle.
-With ``--base64`` each frame is base64-encoded and newline-terminated, which
-survives transports that decode output as text, such as sandbox command logs.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import base64
 import dataclasses
 import inspect
 import itertools
@@ -72,7 +68,7 @@ from typing import IO, Any, Protocol, Self, overload
 
 import anyio
 import anyio.abc
-from anyio.abc import ByteReceiveStream, ByteSendStream, ObjectReceiveStream
+from anyio.abc import ByteReceiveStream, ByteSendStream
 from anyio.streams.buffered import BufferedByteReceiveStream
 from anyio.streams.memory import (
     MemoryObjectReceiveStream,
@@ -168,54 +164,17 @@ async def protected[T](arg: Awaitable[T]) -> T:
     return result  # type: ignore[return-value]
 
 
-def encode_reply(
-    request_id: int, reply: tuple[str, Any], *, b64: bool
-) -> bytes:
+def encode_reply(request_id: int, reply: tuple[str, Any]) -> bytes:
     try:
         inner = pickle.dumps(reply)
     except Exception as exc:
         inner = pickle.dumps(("err", _pickleable_error(exc)))
-    return _frame(request_id, inner, b64=b64)
+    return _frame(request_id, inner)
 
 
-def _frame(request_id: int, inner: bytes, *, b64: bool) -> bytes:
+def _frame(request_id: int, inner: bytes) -> bytes:
     data = pickle.dumps((request_id, inner))
-    frame = _LENGTH.pack(len(data)) + data
-    if b64:
-        return base64.b64encode(frame) + b"\n"
-    return frame
-
-
-class Base64ByteReceiveStream(ByteReceiveStream):
-    """Decode newline-terminated base64 lines from a stream of text."""
-
-    def __init__(self, stream: ObjectReceiveStream[str]) -> None:
-        self._stream = stream
-        self._text = ""
-        self._data = b""
-        self._eof = False
-
-    async def receive(self, max_bytes: int = 65536) -> bytes:
-        while not self._data:
-            line, newline, rest = self._text.partition("\n")
-            if newline:
-                self._text = rest
-            elif self._eof:
-                self._text = ""
-                if not line.strip():
-                    raise anyio.EndOfStream
-            else:
-                try:
-                    self._text += await self._stream.receive()
-                except anyio.EndOfStream:
-                    self._eof = True
-                continue
-            self._data = base64.b64decode(line.strip(), validate=True)
-        data, self._data = self._data[:max_bytes], self._data[max_bytes:]
-        return data
-
-    async def aclose(self) -> None:
-        await self._stream.aclose()
+    return _LENGTH.pack(len(data)) + data
 
 
 def unwrap_reply(data: bytes) -> Any:
@@ -246,9 +205,8 @@ def _pickleable_error(exc: BaseException) -> BaseException:
 class _Server:
     """Handles requests on the worker's event loop."""
 
-    def __init__(self, out: IO[bytes], b64: bool) -> None:
+    def __init__(self, out: IO[bytes]) -> None:
         self._out = out
-        self._b64 = b64
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._iterators: dict[int, Iterator[Any] | AsyncIterator[Any]] = {}
         self._credits: dict[int, _Credits] = {}
@@ -261,7 +219,7 @@ class _Server:
         self._out.flush()
 
     def _reply(self, request_id: int, status: str, value: Any) -> None:
-        self._write(encode_reply(request_id, (status, value), b64=self._b64))
+        self._write(encode_reply(request_id, (status, value)))
 
     def start(self, request_id: int, payload: bytes) -> None:
         try:
@@ -344,7 +302,7 @@ class _Server:
                 except StopIteration as stop:
                     return stop.value
             inner = pickle.dumps(("ok", ("yield", item)))
-            self._write(_frame(request_id, inner, b64=self._b64))
+            self._write(_frame(request_id, inner))
             await asyncio.sleep(0)
 
     async def shutdown(self) -> None:
@@ -443,7 +401,7 @@ def _as_iterator(
     return iter(iterable)  # type: ignore[arg-type]
 
 
-async def _serve(stdin: IO[bytes], out: IO[bytes], b64: bool) -> None:
+async def _serve(stdin: IO[bytes], out: IO[bytes]) -> None:
     loop = asyncio.get_running_loop()
     requests: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue()
 
@@ -458,20 +416,20 @@ async def _serve(stdin: IO[bytes], out: IO[bytes], b64: bool) -> None:
                 return
 
     threading.Thread(target=read_requests, daemon=True).start()
-    server = _Server(out, b64)
+    server = _Server(out)
     while (request := await requests.get()) is not None:
         server.start(*request)
     await server.shutdown()
 
 
-def worker(*, b64: bool) -> None:
+def worker() -> None:
     stdin = sys.stdin.buffer
     out = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
     # Anything the called functions print goes to stderr, keeping stdout
     # for replies.
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
-    asyncio.run(_serve(stdin, out, b64))
+    asyncio.run(_serve(stdin, out))
 
 
 class _Pending:
@@ -850,10 +808,4 @@ def local_worker(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--base64",
-        action="store_true",
-        help="base64-encode replies, one per line",
-    )
-    worker(b64=parser.parse_args().base64)
+    worker()
