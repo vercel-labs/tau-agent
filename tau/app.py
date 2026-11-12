@@ -43,7 +43,7 @@ import textual.widgets
 import textual.worker
 from vercel.api import session as vercel_session
 
-from tau import run_sandbox, run_vercel_sandbox, sandbox, session, tools
+from tau import run_sandbox, run_vercel_sandbox, session, tools
 
 _raw_model = os.environ.get("TAU_MODEL", "gateway:anthropic/claude-opus-5.5")
 MODEL_ID = _raw_model if ":" in _raw_model else f"gateway:{_raw_model}"
@@ -1090,11 +1090,12 @@ class TauApp(textual.app.App[None]):
         require_approval: bool | None = None,
     ) -> None:
         super().__init__()
-        self.model = sandbox.with_resolved_key(ai.get_model(MODEL_ID))
-        self.agent = sandbox.SandboxAgent(
-            sandbox_tools=tools.TOOLS,
-            extra_tools=_provider_tools(MODEL_ID),
-            require_approval=require_approval,
+        self.model = ai.remote.with_resolved_key(ai.get_model(MODEL_ID))
+        self.agent = ai.remote.RemoteAgent(
+            remote_tools=[
+                _with_approval(t, require_approval) for t in tools.TOOLS
+            ],
+            tools=_provider_tools(MODEL_ID),
         )
         self.session = SessionManager(SYSTEM_PROMPT)
         # User messages typed while a turn is streaming.  Drained one at
@@ -1415,6 +1416,16 @@ class TauApp(textual.app.App[None]):
         )
 
 
+def _with_approval(
+    t: ai.AgentTool, require_approval: bool | None
+) -> ai.AgentTool:
+    """``t``, with ``require_approval`` overriding its own, if not None."""
+    if require_approval is None:
+        return t
+    tool = t.tool.model_copy(update={"require_approval": require_approval})
+    return dataclasses.replace(t, tool=tool)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="tau",
@@ -1533,7 +1544,7 @@ def main() -> None:
 
 async def _run_sandboxed(
     resume_path: pathlib.Path | None,
-    mode: sandbox.Mode,
+    mode: ai.remote.Mode,
     require_approval: bool | None,
     *,
     name: str | None,
@@ -1562,7 +1573,7 @@ async def _run_sandboxed(
             await run_vercel_sandbox.sync_project(box, os.getcwd(), "project")
         home = pathlib.PurePosixPath(await worker.run(os.getcwd)).parent
         await worker.run(os.chdir, str(home / "project"))
-        async with sandbox.use_worker(worker, mode):
+        with ai.remote.use_worker(worker, mode):
             app = TauApp(
                 resume_path=resume_path, require_approval=require_approval
             )
