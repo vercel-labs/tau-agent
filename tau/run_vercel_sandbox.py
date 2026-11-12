@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.metadata
 import os
+import posixpath
 import shlex
 import stat
 import subprocess
 import sys
+import tomllib
 from collections.abc import AsyncIterator, Iterable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
 from os import PathLike
 from pathlib import Path
+from typing import Any
 
 from anyio.abc import ByteReceiveStream, ByteSendStream
 from anyio.streams.buffered import BufferedByteReceiveStream
@@ -135,6 +139,54 @@ async def sync_project(box: Sandbox, src_dir: StrPath, target_dir: str) -> None:
     await sync_paths(box, src_dir, target_dir, paths)
 
 
+async def sync_workspace(
+    box: Sandbox, src_dir: StrPath, target_dir: str
+) -> dict[str, str]:
+    """Copies a uv project to a sandbox, with its local path sources.
+
+    Each path source goes where its relative path puts it from
+    ``target_dir``, copied as ``sync_project`` would.  That leaves out
+    ``.git``, so for a source versioned by ``uv-dynamic-versioning``, the
+    returned env sets the version to the one installed here; only one
+    source can be.
+    """
+    await sync_dir(box, src_dir, target_dir)
+    env: dict[str, str] = {}
+    for name, path in _path_sources(Path(src_dir)):
+        if path.is_absolute():
+            raise ValueError(f"path source {name} is absolute: {path}")
+        remote = posixpath.normpath(posixpath.join(target_dir, path.as_posix()))
+        if remote == os.pardir or remote.startswith(os.pardir + "/"):
+            raise ValueError(f"path source {name} is outside the sandbox")
+        local = Path(src_dir, path)
+        await sync_project(box, local, remote)
+        if "uv-dynamic-versioning" in _pyproject(local).get("tool", {}):
+            if _VERSION_BYPASS in env:
+                raise ValueError(
+                    "more than one path source uses uv-dynamic-versioning"
+                )
+            env[_VERSION_BYPASS] = importlib.metadata.version(name)
+    return env
+
+
+_VERSION_BYPASS = "UV_DYNAMIC_VERSIONING_BYPASS"
+
+
+def _pyproject(project_dir: Path) -> dict[str, Any]:
+    with open(project_dir / "pyproject.toml", "rb") as f:
+        return tomllib.load(f)
+
+
+def _path_sources(project_dir: Path) -> list[tuple[str, Path]]:
+    sources = _pyproject(project_dir).get("tool", {}).get("uv", {})
+    found = []
+    for name, entry in sources.get("sources", {}).items():
+        for source in entry if isinstance(entry, list) else [entry]:
+            if "path" in source:
+                found.append((name, Path(source["path"])))
+    return found
+
+
 def _skipped(name: str) -> bool:
     return name.startswith((".venv", ".env")) or name in (".git", ".tau")
 
@@ -175,14 +227,17 @@ async def sandbox_process(
     target_dir: str = "workspace",
     env: dict[str, str] | None = None,
 ) -> AsyncIterator[Process]:
-    """Start a worker in a sandbox on a copy of ``src_dir``, with uv."""
-    await sync_dir(box, src_dir, target_dir)
+    """Start a worker in a sandbox on a copy of ``src_dir``, with uv.
+
+    The copy is made by ``sync_workspace``.
+    """
+    sync_env = await sync_workspace(box, src_dir, target_dir)
     uv, *args = _uv_args(src_dir)
     cmd = await box.create_command(
         uv,
         [*args, "--base64"],
         cwd=target_dir,
-        env=env,
+        env={**sync_env, **(env or {})},
         stdin=subprocess.PIPE,
     )
     assert cmd.stdin is not None and cmd.stdout is not None
@@ -255,12 +310,14 @@ async def pty_sandbox_process(
 
     The worker's stderr goes to a file in the sandbox instead of the terminal.
     """
-    await sync_dir(box, src_dir, target_dir)
+    sync_env = await sync_workspace(box, src_dir, target_dir)
+    env_args = [f"{k}={v}" for k, v in sync_env.items()]
+    command = shlex.join(["env", *env_args, *_uv_args(src_dir)])
     stderr_path = f"/tmp/run_sync-{os.urandom(4).hex()}.err"
     script = (
         f"cd {shlex.quote(target_dir)} && stty raw -echo"
         f" && printf {shlex.quote(_READY.decode())}"
-        f" && exec {shlex.join(_uv_args(src_dir))} 2>{stderr_path}"
+        f" && exec {command} 2>{stderr_path}"
     )
     stack = AsyncExitStack()
     try:

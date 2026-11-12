@@ -1541,8 +1541,9 @@ async def _run_sandboxed(
 ) -> None:
     """Run tau with the ambient worker in a Vercel sandbox.
 
-    The sandbox gets a copy of tau, which the worker runs, and a copy of
-    the current directory, which the worker runs in.  A reopened named
+    The sandbox gets a copy of tau and its local path dependencies,
+    which the worker runs, and a copy of the current directory, which
+    the worker runs in.  A reopened named
     sandbox keeps the copy of the current directory it has.
     """
     print("starting sandbox…", file=sys.stderr)

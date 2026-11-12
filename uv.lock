@@ -8,8 +8,7 @@ resolution-markers = [
 
 [[package]]
 name = "ai"
-version = "0.9.1.dev5+07aaf34"
-source = { git = "https://github.com/vercel-labs/ai-python?branch=sandbox-fixes#07aaf34f985ec378b5e3b998db6c66468935875c" }
+source = { editable = "../py-ai" }
 dependencies = [
     { name = "httpx2" },
     { name = "modelsdotdev" },
@@ -23,6 +22,41 @@ anthropic = [
 ]
 openai = [
     { name = "openai" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.83.0,<2.0.0" },
+    { name = "httpx2", specifier = ">=2.12.0" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.0.0,<3.0.0" },
+    { name = "modelsdotdev", specifier = "==0.*" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=3.42.0,<4.0.0" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.30" },
+    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.30" },
+    { name = "pydantic", specifier = ">=2.13" },
+    { name = "typesafe-sdk", marker = "extra == 'typesafe'", specifier = ">=0.7.5,<1" },
+    { name = "typing-extensions", specifier = ">=4.15.0" },
+    { name = "vercel-oidc", marker = "extra == 'vercel'", specifier = ">=0.8.0" },
+]
+provides-extras = ["anthropic", "mcp", "openai", "otel", "typesafe", "vercel"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "anthropic", specifier = ">=0.83.0" },
+    { name = "async-solipsism", specifier = ">=0.9" },
+    { name = "mcp", specifier = ">=2.0.0,<3.0.0" },
+    { name = "mypy", specifier = "~=2.1.0" },
+    { name = "openai", specifier = ">=3.42.0" },
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.43.0" },
+    { name = "opentelemetry-sdk", specifier = ">=1.43.0" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "python-dotenv", specifier = ">=1.2.1" },
+    { name = "rich", specifier = ">=14.2.0" },
+    { name = "ruff", specifier = "~=0.8.0" },
+    { name = "ty", specifier = "~=0.0.37" },
+    { name = "typesafe-sdk", specifier = ">=0.7.5" },
+    { name = "vercel-oidc", specifier = ">=0.8.0" },
 ]
 
 [[package]]
@@ -1036,7 +1070,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ai", extras = ["anthropic", "openai"], git = "https://github.com/vercel-labs/ai-python?branch=sandbox-fixes" },
+    { name = "ai", extras = ["anthropic", "openai"], editable = "../py-ai" },
     { name = "textual", specifier = ">=3.0" },
     { name = "vercel", specifier = ">=0.12.2" },
 ]
