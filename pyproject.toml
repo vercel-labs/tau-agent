@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "ai[anthropic,openai,sandbox]>=0.8.0",
     "textual>=3.0",
-    "vercel>=0.12.2",
+    "vercel>=0.13.0",
 ]
 
 [project.scripts]
